@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: yt-search-api
+    env: docker
+    region: oregon # or your preferred region
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 10000
