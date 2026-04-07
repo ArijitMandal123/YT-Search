@@ -210,36 +210,57 @@ def perform_search(query, is_direct_url=False, **kwargs):
         ydl_opts['cookiefile'] = final_cookie_path
         print(f"Using cookies from {final_cookie_path}")
     
-    if is_direct_url:
-        search_query = query
-    else:
-        # Avoid huge default search limits if we need specific matches
-        search_query = f"ytsearch{max_results * 5}:{query}" # Increased depth for robustness
+    import urllib.request
+    import urllib.parse
+    import re
+    
+    def fetch_urls_from_html(q, count):
+        print("Using raw HTML scraper to bypass yt-dlp search blocking...")
+        search_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(q)}"
+        req = urllib.request.Request(
+            search_url, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'}
+        )
+        try:
+            html = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
+            video_ids = re.findall(r'"videoId":"([^"]{11})"', html)
+            valid_ids = []
+            for vid in video_ids:
+                if vid not in valid_ids:
+                    valid_ids.append(vid)
+            return [f"https://www.youtube.com/watch?v={vid}" for vid in valid_ids[:count]]
+        except Exception as e:
+            print(f"HTML Scraper failed: {e}")
+            return []
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(search_query, download=False)
-            except Exception as e:
-                error_msg = str(e)
-                # Specific help for JSONDecodeError (Common YouTube Bot Block)
-                if "JSONDecodeError" in error_msg or "Expecting value" in error_msg or "Sign in" in error_msg:
-                    return {
-                        "error": "YouTube is blocking your server IP (Bot Detection).",
-                        "solution": "You MUST add a 'cookies.txt' file to the project folder to bypass this. See README.md for instructions.",
-                        "details": error_msg
-                    }
-                return {"error": error_msg}
+            entries = []
             
-            if not info:
-                return []
-                
-            if 'entries' in info:
-                # It's a search result or playlist
-                entries = info['entries']
+            if is_direct_url:
+                search_query = query
+                try:
+                    info = ydl.extract_info(search_query, download=False)
+                    if info: entries.append(info)
+                except Exception as e:
+                    return {"error": str(e)}
             else:
-                # Direct URL single video
-                entries = [info]
+                # Custom bypass method for blocked search IPs
+                urls_to_try = fetch_urls_from_html(query, max_results * 5)
+                
+                if not urls_to_try:
+                    return {"error": "YouTube blocked both yt-dlp and the raw HTML scraper."}
+                    
+                for url in urls_to_try:
+                    try:
+                        info = ydl.extract_info(url, download=False)
+                        if info: entries.append(info)
+                    except Exception as e:
+                        print(f"Failed to extract info for {url}: {e}")
+                        continue
+            
+            if not entries:
+                return []
                 
             results = []
             
