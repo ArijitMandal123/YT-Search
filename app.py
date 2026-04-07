@@ -276,6 +276,7 @@ def perform_search(query, is_direct_url=False, **kwargs):
 
 @app.route('/', methods=['GET'])
 def health_check():
+    print("Health check accessed by Render", flush=True)
     return jsonify({
         "status": "alive",
         "timestamp": datetime.datetime.utcnow().isoformat(),
