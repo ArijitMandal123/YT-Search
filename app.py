@@ -191,8 +191,15 @@ def perform_search(query, is_direct_url=False, **kwargs):
             try:
                 info = ydl.extract_info(search_query, download=False)
             except Exception as e:
-                # Return the actual error message from yt-dlp
-                return {"error": str(e)}
+                error_msg = str(e)
+                # Specific help for JSONDecodeError (Common YouTube Bot Block)
+                if "JSONDecodeError" in error_msg or "Expecting value" in error_msg or "Sign in" in error_msg:
+                    return {
+                        "error": "YouTube is blocking your server IP (Bot Detection).",
+                        "solution": "You MUST add a 'cookies.txt' file to the project folder to bypass this. See README.md for instructions.",
+                        "details": error_msg
+                    }
+                return {"error": error_msg}
             
             if not info:
                 return []
