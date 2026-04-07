@@ -149,15 +149,24 @@ Render free tiers sleep after 15 minutes of inactivity. To prevent this, you can
 
 ## Avoiding YouTube's "Sign in to confirm you are not a bot"
 
-If you encounter this error, it means YouTube is blocking your IP. To fix this:
+If you encounter this error (especially when deployed on **Render**), it means YouTube is blocking your server's IP address. To fix this securely without exposing your account:
 
-1.  **Update yt-dlp:** Run `.\venv\Scripts\python -m pip install -U yt-dlp` in your terminal.
-2.  **Export Cookies:** If updating doesn't work:
-    - Install the **"Get cookies.txt"** extension in Chrome or Firefox.
-    - Go to YouTube and log in.
-    - Click the extension and export your cookies as a text file named `cookies.txt`.
-    - Place the `cookies.txt` file in the same folder as `app.py`.
-    - The API will automatically detect and use it for authentication.
+1.  Open Chrome or Firefox on your computer.
+2.  Install the **"Get cookies.txt LOCALLY"** extension.
+3.  Go to YouTube.com and make sure you are logged in.
+4.  Click the extension and export your cookies as a text file.
+5.  Open the downloaded text file and **Copy all the text inside**.
+
+**If running Locally:**
+- Paste the file into your project folder and name it exactly `cookies.txt`.
+
+**If Deployed on Render:**
+- Go to your Render Dashboard -> Select your Web Service.
+- Go to the **"Environment"** tab on the left sidebar.
+- Click **"Add Environment Variable"**.
+- Set the Key to `YOUTUBE_COOKIES` and Paste all the text from the file into the Value box.
+- Click **"Save Changes"**.
+- Render will automatically restart your app, read the variable, and securely authenticate with YouTube.
 
 ## Notes
 - If an exact match can't be found (or filters exclude all results), the API will attempt a "similar" fallback search by shortening the query.

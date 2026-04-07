@@ -149,9 +149,19 @@ def perform_search(query, is_direct_url=False, **kwargs):
     """Perform yt-dlp extraction."""
     max_results = kwargs.get('max_results', 1)
     
-    # Check for cookies.txt in the current directory
+    # Check for YOUTUBE_COOKIES environment variable (Great for Render deployments)
     cookie_path = os.path.join(os.getcwd(), 'cookies.txt')
+    env_cookies = os.environ.get('YOUTUBE_COOKIES')
     
+    if env_cookies and not os.path.exists(cookie_path):
+        try:
+            with open(cookie_path, 'w', encoding='utf-8') as f:
+                # Replace literal \n with actual newlines if the user pasted them flat
+                f.write(env_cookies.replace('\\n', '\n'))
+            print("Successfully created cookies.txt from environment variable.")
+        except Exception as e:
+            print(f"Failed to write environment cookies to file: {e}")
+            
     ydl_opts = {
         'format': 'best',
         'noplaylist': True,
