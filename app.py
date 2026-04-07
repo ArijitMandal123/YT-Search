@@ -150,21 +150,34 @@ def perform_search(query, is_direct_url=False, **kwargs):
     max_results = kwargs.get('max_results', 1)
     
     # Check for YOUTUBE_COOKIES environment variable or Render Secret Files
-    cookie_path = os.path.join(os.getcwd(), 'cookies.txt')
     render_secret_path = '/etc/secrets/cookies.txt'
+    local_cookie_path = os.path.join(os.getcwd(), 'cookies.txt')
+    writable_cookie_path = '/tmp/yt_cookies.txt'
     
+    import shutil
+    
+    final_cookie_path = None
+    
+    # Render mounts secrets as read-only. yt-dlp tries to save updated cookies back to the file,
+    # which causes an [Errno 30] Read-only file system error.
+    # Therefore, we MUST copy it to a writable directory like /tmp
     if os.path.exists(render_secret_path):
-        cookie_path = render_secret_path
+        try:
+            shutil.copyfile(render_secret_path, writable_cookie_path)
+            final_cookie_path = writable_cookie_path
+        except Exception as e:
+            print(f"Failed to copy secret cookies to writable path: {e}")
+            final_cookie_path = render_secret_path # Fallback, though likely to fail
+    elif os.path.exists(local_cookie_path):
+        final_cookie_path = local_cookie_path
         
     env_cookies = os.environ.get('YOUTUBE_COOKIES')
-    
-    if env_cookies and not os.path.exists(cookie_path) and not os.path.exists(render_secret_path):
+    if env_cookies and not final_cookie_path:
         try:
-            with open(cookie_path, 'w', encoding='utf-8') as f:
-                # Replace literal \n with actual newlines if the user pasted them flat
-                # Also handle \t tab characters
+            with open(writable_cookie_path, 'w', encoding='utf-8') as f:
                 formatted = env_cookies.replace('\\n', '\n').replace('\\t', '\t')
                 f.write(formatted)
+            final_cookie_path = writable_cookie_path
             print("Successfully created cookies.txt from environment variable.")
         except Exception as e:
             print(f"Failed to write environment cookies to file: {e}")
@@ -193,9 +206,9 @@ def perform_search(query, is_direct_url=False, **kwargs):
         }
     }
     
-    if os.path.exists(cookie_path):
-        ydl_opts['cookiefile'] = cookie_path
-        print(f"Using cookies from {cookie_path}")
+    if final_cookie_path:
+        ydl_opts['cookiefile'] = final_cookie_path
+        print(f"Using cookies from {final_cookie_path}")
     
     if is_direct_url:
         search_query = query
