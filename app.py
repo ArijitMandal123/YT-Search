@@ -2,6 +2,10 @@ import os
 import datetime
 from flask import Flask, request, jsonify
 import yt_dlp
+import urllib.request
+import urllib.parse
+import re
+import json
 
 app = Flask(__name__)
 
@@ -46,17 +50,14 @@ def get_best_format(formats, media_type, prefer_format, max_filesize_mb, quality
         is_both = has_video and has_audio
         
         if media_type == 'video':
-            # Prefer merged formats (both video and audio)
+            # We want video out of this (it might have audio or just be video)
             if not has_video:
                 continue
         elif media_type == 'audio':
-            # Prefer audio-only or anything with audio
+            # We want audio
             if not has_audio:
                 continue
                 
-        # Filter by preferred format extension if strictly requested
-        # We might not strictly filter if we don't find it, but we can score it higher.
-        
         valid_formats.append(f)
         
     if not valid_formats:
@@ -75,7 +76,7 @@ def get_best_format(formats, media_type, prefer_format, max_filesize_mb, quality
         if media_type == 'video':
             # Prefer combined video+audio
             if vcodec != 'none' and acodec != 'none':
-                score += 50
+                score += 500
             if quality == 'best':
                 height = f.get('height', 0) or 0
                 score += height
@@ -83,10 +84,12 @@ def get_best_format(formats, media_type, prefer_format, max_filesize_mb, quality
                 height = f.get('height', 0) or 0
                 score -= height
             elif quality.endswith('p'):
-                target_h = int(quality[:-1])
-                height = f.get('height', 0) or 0
-                # Penalize distance from target
-                score -= abs(target_h - height)
+                try:
+                    target_h = int(quality[:-1])
+                    height = f.get('height', 0) or 0
+                    score -= abs(target_h - height)
+                except ValueError:
+                    pass
         elif media_type == 'audio':
             if acodec != 'none' and vcodec == 'none':
                 score += 50 # audio only
@@ -145,6 +148,26 @@ def extract_video_info(video, media_type, prefer_format, max_filesize_mb, qualit
         "view_count": video.get('view_count')
     }
 
+def fetch_urls_from_html(query, count):
+    """Custom bypass: scrape YouTube search DOM directly to avoid ytsearch: blocks."""
+    print(f"Using raw HTML scraper for query: {query}")
+    search_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+    req = urllib.request.Request(
+        search_url, 
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'}
+    )
+    try:
+        html = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
+        video_ids = re.findall(r'"videoId":"([^"]{11})"', html)
+        valid_ids = []
+        for vid in video_ids:
+            if vid not in valid_ids:
+                valid_ids.append(vid)
+        return [f"https://www.youtube.com/watch?v={vid}" for vid in valid_ids[:count]]
+    except Exception as e:
+        print(f"HTML Scraper failed: {e}")
+        return []
+
 def perform_search(query, is_direct_url=False, **kwargs):
     """Perform yt-dlp extraction."""
     max_results = kwargs.get('max_results', 1)
@@ -158,51 +181,31 @@ def perform_search(query, is_direct_url=False, **kwargs):
     
     final_cookie_path = None
     
-    # Render mounts secrets as read-only. yt-dlp tries to save updated cookies back to the file,
-    # which causes an [Errno 30] Read-only file system error.
-    # Therefore, we MUST copy it to a writable directory like /tmp
     if os.path.exists(render_secret_path):
         try:
             shutil.copyfile(render_secret_path, writable_cookie_path)
             final_cookie_path = writable_cookie_path
         except Exception as e:
             print(f"Failed to copy secret cookies to writable path: {e}")
-            final_cookie_path = render_secret_path # Fallback, though likely to fail
+            final_cookie_path = render_secret_path
     elif os.path.exists(local_cookie_path):
         final_cookie_path = local_cookie_path
         
-    env_cookies = os.environ.get('YOUTUBE_COOKIES')
-    if env_cookies and not final_cookie_path:
-        try:
-            with open(writable_cookie_path, 'w', encoding='utf-8') as f:
-                formatted = env_cookies.replace('\\n', '\n').replace('\\t', '\t')
-                f.write(formatted)
-            final_cookie_path = writable_cookie_path
-            print("Successfully created cookies.txt from environment variable.")
-        except Exception as e:
-            print(f"Failed to write environment cookies to file: {e}")
-            
     ydl_opts = {
-        'format': 'best',
+        # CRITICAL FIX: "best" fails on many iOS/Android clients because merged 720p 
+        # streams were removed by YouTube. Use bestvideo+bestaudio/best.
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
-        'nocheckcertificate': True, # Avoid SSL/Empty response issues
-        'geo_bypass': True,         # Help with regional blocks
-        # Browser impersonation to avoid "Sign in to confirm you're not a bot"
+        'nocheckcertificate': True,
+        'geo_bypass': True,
+        # Allow yt-dlp to cycle through all modern clients (web, mweb, ios, tv).
+        # We explicitly DO NOT skip 'dash' streams, because skipping DASH destroys 
+        # most high-quality separate audio/video chunks.
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-        },
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['ios', 'android'], # ios is currently the most resilient
-                'skip': ['hls', 'dash']
-            }
         }
     }
     
@@ -210,46 +213,22 @@ def perform_search(query, is_direct_url=False, **kwargs):
         ydl_opts['cookiefile'] = final_cookie_path
         print(f"Using cookies from {final_cookie_path}")
     
-    import urllib.request
-    import urllib.parse
-    import re
-    
-    def fetch_urls_from_html(q, count):
-        print("Using raw HTML scraper to bypass yt-dlp search blocking...")
-        search_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(q)}"
-        req = urllib.request.Request(
-            search_url, 
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'}
-        )
-        try:
-            html = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
-            video_ids = re.findall(r'"videoId":"([^"]{11})"', html)
-            valid_ids = []
-            for vid in video_ids:
-                if vid not in valid_ids:
-                    valid_ids.append(vid)
-            return [f"https://www.youtube.com/watch?v={vid}" for vid in valid_ids[:count]]
-        except Exception as e:
-            print(f"HTML Scraper failed: {e}")
-            return []
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             entries = []
             
             if is_direct_url:
-                search_query = query
                 try:
-                    info = ydl.extract_info(search_query, download=False)
+                    info = ydl.extract_info(query, download=False)
                     if info: entries.append(info)
                 except Exception as e:
                     return {"error": str(e)}
             else:
-                # Custom bypass method for blocked search IPs
+                # Bypass yt-dlp's blocked ytsearch API entirely
                 urls_to_try = fetch_urls_from_html(query, max_results * 5)
                 
                 if not urls_to_try:
-                    return {"error": "YouTube blocked both yt-dlp and the raw HTML scraper."}
+                    return {"error": "YouTube blocked the raw HTML search scraper."}
                     
                 for url in urls_to_try:
                     try:
@@ -268,7 +247,7 @@ def perform_search(query, is_direct_url=False, **kwargs):
                 if not video:
                     continue
                 
-                # Skip live streams (they don't have a stable direct URL for easy download)
+                # Skip live streams
                 if video.get('is_live') or video.get('live_status') == 'is_live' or video.get('duration') == 0:
                     continue
                     
@@ -290,12 +269,12 @@ def perform_search(query, is_direct_url=False, **kwargs):
                     quality=kwargs.get('quality', 'best')
                 )
                 
-                # Check filesize filter again (sometimes format extraction finds different size)
-                if kwargs.get('max_filesize_mb') and extracted['filesize_mb']:
+                if kwargs.get('max_filesize_mb') and extracted and extracted.get('filesize_mb'):
                     if extracted['filesize_mb'] > kwargs.get('max_filesize_mb'):
                         continue
                 
-                results.append(extracted)
+                if extracted:
+                    results.append(extracted)
                 
                 if len(results) >= max_results:
                     break
@@ -304,24 +283,16 @@ def perform_search(query, is_direct_url=False, **kwargs):
     except Exception as e:
         error_msg = str(e)
         print(f"Internal error during extraction: {error_msg}")
-        
-        # Specific help for JSONDecodeError (Common YouTube Bot Block)
-        if "JSONDecodeError" in error_msg or "Expecting value" in error_msg:
-            return {
-                "error": "YouTube is blocking your server IP (Bot Detection).",
-                "solution": "You MUST add a 'cookies.txt' file to the project folder to bypass this. See README.md for instructions.",
-                "details": error_msg
-            }
-            
         return {"error": f"Internal server error: {error_msg}"}
 
 @app.route('/', methods=['GET'])
 def health_check():
-    print("Health check accessed by Render", flush=True)
+    print("Health check accessed", flush=True)
     return jsonify({
         "status": "alive",
         "timestamp": datetime.datetime.utcnow().isoformat(),
-        "service": "yt-search-api"
+        "service": "yt-search-api",
+        "engine": "yt-dlp-custom"
     })
 
 @app.route('/search', methods=['POST'])
@@ -342,13 +313,10 @@ def search_youtube():
         'quality': data.get('quality', 'best')
     }
     
-    # 1. Check if direct URL
     is_direct_url = query.startswith('http://') or query.startswith('https://')
     
-    # 2. Try Exact Search
     results = perform_search(query, is_direct_url=is_direct_url, **search_kwargs)
     
-    # Check if we got an error from yt-dlp
     if isinstance(results, dict) and "error" in results:
         return jsonify({
             "success": False,
@@ -367,19 +335,13 @@ def search_youtube():
             "results": results
         })
         
-    # 3. Fallback: Similar Search (if not direct URL and no results found)
     if not is_direct_url:
         words = query.split()
         if len(words) > 1:
-            # Simple fallback: try using just the first 2-3 words, dropping potential overly-restrictive words
             similar_query = " ".join(words[:max(1, len(words) - 1)])
-            
-            # Relax some constraints for the fallback
             fallback_kwargs = dict(search_kwargs)
-            
             similar_results = perform_search(similar_query, is_direct_url=False, **fallback_kwargs)
             
-            # Check for error in fallback too
             if isinstance(similar_results, dict) and "error" in similar_results:
                  return jsonify({
                     "success": False,
@@ -407,6 +369,5 @@ def search_youtube():
     }), 404
 
 if __name__ == '__main__':
-    # For local testing, use PORT env var or default to 7860 (HF Spaces default)
     port = int(os.environ.get("PORT", 7860))
     app.run(host='0.0.0.0', port=port, debug=True)
