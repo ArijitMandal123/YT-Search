@@ -147,6 +147,19 @@ Render free tiers sleep after 15 minutes of inactivity. To prevent this, you can
 2. Set the interval to **14 minutes**.
 3. Connect it to an **HTTP Request** node calling `GET https://your-render-app-url.onrender.com/`.
 
+## Avoiding YouTube's "Sign in to confirm you are not a bot"
+
+If you encounter this error, it means YouTube is blocking your IP. To fix this:
+
+1.  **Update yt-dlp:** Run `.\venv\Scripts\python -m pip install -U yt-dlp` in your terminal.
+2.  **Export Cookies:** If updating doesn't work:
+    - Install the **"Get cookies.txt"** extension in Chrome or Firefox.
+    - Go to YouTube and log in.
+    - Click the extension and export your cookies as a text file named `cookies.txt`.
+    - Place the `cookies.txt` file in the same folder as `app.py`.
+    - The API will automatically detect and use it for authentication.
+
 ## Notes
 - If an exact match can't be found (or filters exclude all results), the API will attempt a "similar" fallback search by shortening the query.
 - Pass a direct YouTube URL in the `query` field to extract streams immediately without searching.
+- **Lightweight & Fast:** This tool only extracts metadata; it never downloads or saves files to your server's storage.

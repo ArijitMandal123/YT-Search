@@ -149,19 +149,40 @@ def perform_search(query, is_direct_url=False, **kwargs):
     """Perform yt-dlp extraction."""
     max_results = kwargs.get('max_results', 1)
     
+    # Check for cookies.txt in the current directory
+    cookie_path = os.path.join(os.getcwd(), 'cookies.txt')
+    
     ydl_opts = {
         'format': 'best',
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
-        'extract_flat': False, # We need the actual formats
+        'extract_flat': False,
+        # Browser impersonation to avoid "Sign in to confirm you're not a bot"
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+        },
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+                'skip': ['hls', 'dash'] # Faster extraction
+            }
+        }
     }
+    
+    if os.path.exists(cookie_path):
+        ydl_opts['cookiefile'] = cookie_path
+        print(f"Using cookies from {cookie_path}")
     
     if is_direct_url:
         search_query = query
     else:
         # Avoid huge default search limits if we need specific matches
-        search_query = f"ytsearch{max_results * 3}:{query}"
+        search_query = f"ytsearch{max_results * 5}:{query}" # Increased depth for robustness
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
