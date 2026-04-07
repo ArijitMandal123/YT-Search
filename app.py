@@ -158,6 +158,8 @@ def perform_search(query, is_direct_url=False, **kwargs):
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
+        'nocheckcertificate': True, # Avoid SSL/Empty response issues
+        'geo_bypass': True,         # Help with regional blocks
         # Browser impersonation to avoid "Sign in to confirm you're not a bot"
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -168,8 +170,8 @@ def perform_search(query, is_direct_url=False, **kwargs):
         },
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
-                'skip': ['hls', 'dash'] # Faster extraction
+                'player_client': ['ios', 'android'], # ios is currently the most resilient
+                'skip': ['hls', 'dash']
             }
         }
     }
@@ -242,8 +244,18 @@ def perform_search(query, is_direct_url=False, **kwargs):
                     
             return results
     except Exception as e:
-        print(f"Internal error during extraction: {str(e)}")
-        return {"error": f"Internal server error: {str(e)}"}
+        error_msg = str(e)
+        print(f"Internal error during extraction: {error_msg}")
+        
+        # Specific help for JSONDecodeError (Common YouTube Bot Block)
+        if "JSONDecodeError" in error_msg or "Expecting value" in error_msg:
+            return {
+                "error": "YouTube is blocking your server IP (Bot Detection).",
+                "solution": "You MUST add a 'cookies.txt' file to the project folder to bypass this. See README.md for instructions.",
+                "details": error_msg
+            }
+            
+        return {"error": f"Internal server error: {error_msg}"}
 
 @app.route('/', methods=['GET'])
 def health_check():
