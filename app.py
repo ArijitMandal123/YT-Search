@@ -165,8 +165,15 @@ def perform_search(query, is_direct_url=False, **kwargs):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_query, download=False)
+            try:
+                info = ydl.extract_info(search_query, download=False)
+            except Exception as e:
+                # Return the actual error message from yt-dlp
+                return {"error": str(e)}
             
+            if not info:
+                return []
+                
             if 'entries' in info:
                 # It's a search result or playlist
                 entries = info['entries']
@@ -178,6 +185,10 @@ def perform_search(query, is_direct_url=False, **kwargs):
             
             for video in entries:
                 if not video:
+                    continue
+                
+                # Skip live streams (they don't have a stable direct URL for easy download)
+                if video.get('is_live') or video.get('live_status') == 'is_live' or video.get('duration') == 0:
                     continue
                     
                 # Apply filters
@@ -210,8 +221,8 @@ def perform_search(query, is_direct_url=False, **kwargs):
                     
             return results
     except Exception as e:
-        print(f"Error during yt-dlp extraction: {str(e)}")
-        return None
+        print(f"Internal error during extraction: {str(e)}")
+        return {"error": f"Internal server error: {str(e)}"}
 
 @app.route('/', methods=['GET'])
 def health_check():
@@ -245,6 +256,14 @@ def search_youtube():
     # 2. Try Exact Search
     results = perform_search(query, is_direct_url=is_direct_url, **search_kwargs)
     
+    # Check if we got an error from yt-dlp
+    if isinstance(results, dict) and "error" in results:
+        return jsonify({
+            "success": False,
+            "error": results["error"],
+            "query": query
+        }), 500
+
     if results and len(results) > 0:
         return jsonify({
             "success": True,
@@ -265,11 +284,18 @@ def search_youtube():
             
             # Relax some constraints for the fallback
             fallback_kwargs = dict(search_kwargs)
-            # Example logic: we could disable duration/size constraints to see if *anything* matches,
-            # but let's just use the shorter query first.
             
             similar_results = perform_search(similar_query, is_direct_url=False, **fallback_kwargs)
             
+            # Check for error in fallback too
+            if isinstance(similar_results, dict) and "error" in similar_results:
+                 return jsonify({
+                    "success": False,
+                    "error": similar_results["error"],
+                    "query": query,
+                    "search_method": "similar_attempted"
+                }), 500
+
             if similar_results and len(similar_results) > 0:
                 return jsonify({
                     "success": True,
@@ -285,7 +311,7 @@ def search_youtube():
     return jsonify({
         "success": False,
         "query": query,
-        "error": "No results found matching criteria."
+        "error": "No videos found matching criteria (skipping livestreams)."
     }), 404
 
 if __name__ == '__main__':
