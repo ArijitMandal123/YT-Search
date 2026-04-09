@@ -17,15 +17,37 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────────
 
 PIPED_INSTANCES = [
-    # private.coffee is the only reliably working Piped instance (as of 2026-04).
     "https://api.piped.private.coffee",
 ]
 
+# Cache for dynamic piped instances
+_dynamic_piped_instances = []
+_last_piped_fetch = 0
+
 INVIDIOUS_INSTANCES = [
-    # These return 403 frequently but sometimes work — worth a quick try.
+    # PRIMARY: Only instance with API=true AND 99.5% playback ratio
+    "https://inv.thepixora.com",
+    # SECONDARY: API=false but sometimes still serves streams
+    "https://invidious.nerdvpn.de",
     "https://inv.nadeko.net",
     "https://yewtu.be",
 ]
+
+# ─────────────────────────────────────────────────────────────
+# Instance Health Tracking
+# ─────────────────────────────────────────────────────────────
+# Track which instances fail and deprioritize them within a request cycle.
+_instance_failures = {}  # {url: last_failure_timestamp}
+FAILURE_COOLDOWN = 300   # 5 min cooldown for failed instances
+
+def _is_instance_healthy(url):
+    last_fail = _instance_failures.get(url)
+    if last_fail and (time.time() - last_fail) < FAILURE_COOLDOWN:
+        return False
+    return True
+
+def _mark_instance_failed(url):
+    _instance_failures[url] = time.time()
 
 # Global flag: if yt-dlp direct-URL extraction has already failed once in
 # this request, don't retry it for every candidate video (saves ~10s each).
@@ -238,10 +260,38 @@ class PipedBackend:
     name = "piped"
 
     @staticmethod
+    def _refresh_piped_instances():
+        global _dynamic_piped_instances, _last_piped_fetch
+        # Refresh hourly to avoid spamming
+        if time.time() - _last_piped_fetch < 3600 and _dynamic_piped_instances:
+            return
+
+        try:
+            r = http_requests.get("https://piped-instances.kavin.rocks/", timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                new_instances = []
+                for inst in data:
+                    if inst.get('up_to_date') and inst.get('api_url') and inst.get('uptime_24h', 0) > 95:
+                        api_url = inst['api_url']
+                        if api_url not in PIPED_INSTANCES:
+                            new_instances.append(api_url)
+                _dynamic_piped_instances = new_instances
+                _last_piped_fetch = time.time()
+                print(f"[Piped] Refreshed {len(new_instances)} dynamic instances", flush=True)
+        except Exception as e:
+            print(f"[Piped] Failed to fetch instances: {e}", flush=True)
+
+    @staticmethod
     def _get_instance():
-        # NO shuffle — order matters. Reliable instances go first to avoid
-        # wasting timeout seconds on dead ones (critical for n8n 60s limit).
-        return list(PIPED_INSTANCES)
+        PipedBackend._refresh_piped_instances()
+        all_instances = PIPED_INSTANCES + _dynamic_piped_instances
+        
+        # Prioritize healthy instances over recently failed ones
+        healthy = [inst for inst in all_instances if _is_instance_healthy(inst)]
+        unhealthy = [inst for inst in all_instances if not _is_instance_healthy(inst)]
+        
+        return healthy + unhealthy
 
     @staticmethod
     def search(query, max_results=5, **kwargs):
@@ -275,10 +325,15 @@ class PipedBackend:
                     results.sort(key=lambda r: r.get('views', 0), reverse=True)
                     print(f"[Piped] Found {len(results)} results from {base}", flush=True)
                     for i, r in enumerate(results[:5]):
-                        print(f"  #{i+1} views={r['views']:>10,} dur={r['duration']:>4}s [{r['videoId']}] {r['title'][:60]}", flush=True)
+                        try:
+                            print(f"  #{i+1} views={r['views']:>10,} dur={r['duration']:>4}s [{r['videoId']}] {r['title'][:60]}", flush=True)
+                        except UnicodeEncodeError:
+                            clean_title = r['title'][:60].encode('ascii', 'ignore').decode('ascii')
+                            print(f"  #{i+1} views={r['views']:>10,} dur={r['duration']:>4}s [{r['videoId']}] {clean_title}", flush=True)
                     return results
             except Exception as e:
-                print(f"[Piped] {base} error: {e}", flush=True)
+                print(f"[Piped] {base} search error: {e}", flush=True)
+                _mark_instance_failed(base)
                 continue
         return []
 
@@ -296,6 +351,7 @@ class PipedBackend:
                 data = r.json()
                 if data.get('error'):
                     print(f"[Piped] {base} stream error: {data['error']}", flush=True)
+                    _mark_instance_failed(base)
                     continue
 
                 # Combine all available streams
@@ -321,13 +377,13 @@ class PipedBackend:
                     print(f"[Piped] Got {len(all_streams)} streams from {base}", flush=True)
                     return all_streams, meta
 
-                # Try HLS as fallback
                 if data.get('hls'):
                     print(f"[Piped] Using HLS from {base}", flush=True)
                     return [{'url': data['hls'], 'mimeType': 'video/mp4', 'height': 720, 'width': 1280, 'bitrate': 0, 'videoOnly': False}], meta
 
             except Exception as e:
                 print(f"[Piped] {base} stream error: {e}", flush=True)
+                _mark_instance_failed(base)
                 continue
         return [], {}
 
@@ -341,7 +397,10 @@ class InvidiousBackend:
 
     @staticmethod
     def _get_instance():
-        return list(INVIDIOUS_INSTANCES)
+        # Order matters
+        healthy = [inst for inst in INVIDIOUS_INSTANCES if _is_instance_healthy(inst)]
+        unhealthy = [inst for inst in INVIDIOUS_INSTANCES if not _is_instance_healthy(inst)]
+        return healthy + unhealthy
 
     @staticmethod
     def search(query, max_results=5, **kwargs):
@@ -353,6 +412,7 @@ class InvidiousBackend:
                 r = http_requests.get(url, timeout=BACKEND_TIMEOUT)
                 if r.status_code != 200:
                     print(f"[Invidious] {base} returned {r.status_code}", flush=True)
+                    _mark_instance_failed(base)
                     continue
                 data = r.json()
                 if not isinstance(data, list):
@@ -383,7 +443,8 @@ class InvidiousBackend:
                     print(f"[Invidious] Found {len(results)} results from {base}", flush=True)
                     return results
             except Exception as e:
-                print(f"[Invidious] {base} error: {e}", flush=True)
+                print(f"[Invidious] {base} search error: {e}", flush=True)
+                _mark_instance_failed(base)
                 continue
         return []
 
@@ -397,10 +458,12 @@ class InvidiousBackend:
                 r = http_requests.get(url, timeout=BACKEND_TIMEOUT)
                 if r.status_code != 200:
                     print(f"[Invidious] {base} video returned {r.status_code}", flush=True)
+                    _mark_instance_failed(base)
                     continue
                 data = r.json()
                 if data.get('error'):
                     print(f"[Invidious] {base} video error: {data['error']}", flush=True)
+                    _mark_instance_failed(base)
                     continue
 
                 all_streams = []
@@ -468,6 +531,7 @@ class InvidiousBackend:
 
             except Exception as e:
                 print(f"[Invidious] {base} stream error: {e}", flush=True)
+                _mark_instance_failed(base)
                 continue
         return [], {}
 
@@ -524,25 +588,34 @@ class YtDlpBackend:
         duration_max = kwargs.get('duration_max')
 
         ydl_opts = {
-            'format': 'best[ext=mp4]/best',  # Simple format to avoid "format not available"
+            'format': 'bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/b',  # Select best video + best audio directly
             'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
             'nocheckcertificate': True,
             'geo_bypass': True,
-            'socket_timeout': 8,
+            'socket_timeout': 10,
+            'sleep_requests': 2,
+            'sleep_interval': 3,
+            'max_sleep_interval': 6,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             },
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web_creator', 'ios', 'web'],
+                },
+            },
         }
 
-        # Check for cookies — copy from read-only paths to /tmp first
-        cookie_paths = ['/etc/secrets/cookies.txt', '/tmp/yt_cookies.txt', os.path.join(os.getcwd(), 'cookies.txt')]
-        writable_cookie = '/tmp/yt_cookies.txt'
+        import tempfile
+        writable_cookie = os.path.join(tempfile.gettempdir(), 'yt_cookies.txt')
+        cookie_paths = ['/etc/secrets/cookies.txt', writable_cookie, os.path.join(os.getcwd(), 'cookies.txt')]
+        
         for cp in cookie_paths:
             if os.path.exists(cp):
-                # If the cookie file is on a read-only FS, copy it to /tmp
+                # If the cookie file is on a read-only FS or we just want to ensure it's writable
                 if cp != writable_cookie:
                     try:
                         import shutil
@@ -664,7 +737,9 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
             if result:
                 return [result], None
         # Fallback to yt-dlp for direct URL
-        results = YtDlpBackend.search_and_extract(query, max_results=1, is_direct_url=True, **kwargs)
+        # remove max_results from kwargs to avoid TypeError
+        kw = {k: v for k, v in kwargs.items() if k != 'max_results'}
+        results = YtDlpBackend.search_and_extract(query, max_results=1, is_direct_url=True, **kw)
         if results:
             return results, None
         return [], "Could not extract video from URL"
@@ -690,7 +765,8 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     is_on_render = os.environ.get('RENDER') or os.environ.get('PORT') == '7860'
     if not search_results and not is_on_render and elapsed() < 25:
         print("[Orchestrator] Proxy searches failed, trying yt-dlp fallback...", flush=True)
-        results = YtDlpBackend.search_and_extract(query, max_results=max_results, is_direct_url=False, **kwargs)
+        kw = {k: v for k, v in kwargs.items() if k != 'max_results'}
+        results = YtDlpBackend.search_and_extract(query, max_results=max_results, is_direct_url=False, **kw)
         if results:
             return results, None
 
@@ -835,6 +911,31 @@ def _extract_video_id(url):
 # Flask Routes
 # ─────────────────────────────────────────────────────────────
 
+STRIP_WORDS = ['4k', '1080p', '720p', 'raw', 'no subs', 'subs', 'hd', 'uhd', 'amv', 'edit', 'remastered', 'no']
+
+def simplify_query(q):
+    """Progressively simplify a query by removing common qualifiers."""
+    words = q.lower().split()
+    for strip in STRIP_WORDS:
+        strip_parts = strip.split()
+        # Fast path for single-word
+        if len(strip_parts) == 1:
+            if strip in words:
+                words.remove(strip)
+        else:
+            # multi-word strip (like "no subs")
+            joined = " ".join(words)
+            if strip in joined:
+                joined = joined.replace(strip, "").strip()
+                # fix double spaces
+                joined = " ".join(joined.split())
+                words = joined.split()
+                
+    # Also strip the last word as a fallback if not much changed
+    if len(words) > 2:
+        return " ".join(words[:max(1, len(words) - 1)])
+    return " ".join(words)
+
 @app.route('/', methods=['GET'])
 def health_check():
     """Health check endpoint for Render."""
@@ -890,11 +991,10 @@ def search_youtube():
                 "query": query,
             }), 404
 
-        # Try similar query as fallback (remove last word)
+        # Try similar query as fallback
         if not is_direct_url:
-            words = query.split()
-            if len(words) > 1:
-                similar_query = " ".join(words[:max(1, len(words) - 1)])
+            similar_query = simplify_query(query)
+            if similar_query and similar_query != query.lower():
                 print(f"[Search] Trying similar query: '{similar_query}'", flush=True)
                 results, error2 = perform_search_multi(similar_query, is_direct_url=False, **search_kwargs)
                 if results:
@@ -923,6 +1023,40 @@ def search_youtube():
         "exact_match": True,
         "search_method": "multi_backend",
         "results": results,
+    })
+
+
+@app.route('/debug', methods=['GET'])
+def debug_instances():
+    """Test all backends with a small video to find which are active."""
+    test_video = 'BaW_jenozKc' # youtube-dl test video (~10s)
+    
+    report = {
+        "piped": [],
+        "invidious": []
+    }
+    
+    # Check Piped
+    PipedBackend._refresh_piped_instances()
+    all_piped = PIPED_INSTANCES + _dynamic_piped_instances
+    for inst in all_piped:
+        try:
+            r = http_requests.get(f"{inst}/streams/{test_video}", timeout=3)
+            report["piped"].append({"instance": inst, "status": r.status_code, "healthy": _is_instance_healthy(inst)})
+        except Exception as e:
+             report["piped"].append({"instance": inst, "status": str(e), "healthy": _is_instance_healthy(inst)})
+             
+    # Check Invidious
+    for inst in INVIDIOUS_INSTANCES:
+        try:
+            r = http_requests.get(f"{inst}/api/v1/videos/{test_video}", timeout=3)
+            report["invidious"].append({"instance": inst, "status": r.status_code, "healthy": _is_instance_healthy(inst)})
+        except Exception as e:
+             report["invidious"].append({"instance": inst, "status": str(e), "healthy": _is_instance_healthy(inst)})
+
+    return jsonify({
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "report": report
     })
 
 

@@ -4,17 +4,33 @@ sys.path.insert(0, '.')
 from app import perform_search_multi
 
 print("=" * 70)
-print("Testing: The Apothecary Diaries Maomao Jinshi investigation 4k")
+print("Testing: One Piece Laboon whale tragic promise 4k raw no subs")
 print("=" * 70)
 
+# Simulate what the /search endpoint does for a normal query (which includes simplifying the query as fallback)
+from app import simplify_query
+
+query = 'One Piece Laboon whale tragic promise 4k raw no subs'
 results, error = perform_search_multi(
-    'The Apothecary Diaries Maomao Jinshi investigation 4k',
+    query,
     is_direct_url=False,
     type='video',
     max_results=1,
     quality='1080p',
-    max_filesize_mb=150,
+    max_filesize_mb=250,
 )
+
+if not results:
+    s_query = simplify_query(query)
+    print(f"\nTrying simplified query: {s_query}")
+    results, error = perform_search_multi(
+        s_query,
+        is_direct_url=False,
+        type='video',
+        max_results=1,
+        quality='1080p',
+        max_filesize_mb=250,
+    )
 print("\n" + "=" * 70)
 print(f"Error: {error}")
 print(f"Results count: {len(results)}")
