@@ -20,14 +20,13 @@ PIPED_INSTANCES = [
     # private.coffee is the gold standard (99% uptime).
     "https://api.piped.private.coffee",
     # Reliable failover instances.
-    "https://api-piped.mha.fi",
-    "https://piped-api.hostux.net",
+    "https://pipedapi.kavin.rocks",
+    "https://api.piped.projectsegfau.lt",
 ]
 
 INVIDIOUS_INSTANCES = [
-    "https://inv.nadeko.net",
-    "https://invidious.nerdvpn.de",
-    "https://yewtu.be",
+    "https://invidious.jing.rocks",
+    "https://vid.priv.au",
 ]
 
 # Timeout for each backend HTTP call (seconds).
@@ -843,6 +842,16 @@ def search_youtube():
     results, error = perform_search_multi(query, is_direct_url=is_direct_url, **search_kwargs)
 
     if error and not results:
+        # If we got a timeout error, do NOT try a similar query, as it will also timeout
+        # and cause a 502 Bad Gateway on Render's 100s Load Balancer limit.
+        if "Timed out" in error:
+            print(f"[Search] Skipping similar query because error was a timeout: {error}", flush=True)
+            return jsonify({
+                "success": False,
+                "error": error,
+                "query": query,
+            }), 404
+
         # Try similar query as fallback (remove last word)
         if not is_direct_url:
             words = query.split()
