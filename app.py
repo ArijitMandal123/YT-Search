@@ -187,6 +187,10 @@ def select_best_stream(streams, media_type='video', quality='best', max_filesize
             if m:
                 height = int(m.group(1))
 
+        # Absolute blocker: Do not append dummy 0p streams if a video is explicitly requested.
+        if media_type == 'video' and height == 0:
+            continue
+
         candidates.append({
             'url': url,
             'height': height,
@@ -212,6 +216,18 @@ def select_best_stream(streams, media_type='video', quality='best', max_filesize
     combined = [c for c in candidates if c['has_both']]
     video_only_list = [c for c in candidates if not c['has_both'] and not ('audio' in (c.get('mime') or ''))]
 
+    # STRCIT PIPELINE ENFORCEMENT:
+    # If the user requested a video, they need something fully playable (audio + video).
+    # If a proxy backend (like Piped) only returns silent video streams, we MUST fail it
+    # and return None. This forces the orchestrator to try the next proxy which might have combined streams!
+    if media_type == 'video':
+        if not combined:
+            return None
+        # Only evaluate combined streams
+        candidates_to_score = combined
+    else:
+        candidates_to_score = candidates
+
     def _score(c, filesize_limit=None):
         score = 0
 
@@ -219,10 +235,6 @@ def select_best_stream(streams, media_type='video', quality='best', max_filesize
         # If the stream is silent (no audio), it requires muxing via ffmpeg. n8n pipelines need a fully playable URL.
         if c['has_both']:
             score += 50000
-
-        # === Tier 1.5: Reject dummy 0p streams for video requests ===
-        if media_type == 'video' and c['height'] == 0:
-            score -= 100000
 
         # === Tier 2: Resolution matching ===
         if media_type == 'video':
@@ -270,12 +282,15 @@ def select_best_stream(streams, media_type='video', quality='best', max_filesize
         return score
 
     # Score all candidates
-    for c in candidates:
+    for c in candidates_to_score:
         c['_score'] = _score(c, filesize_limit=max_filesize_mb)
 
-    candidates.sort(key=lambda c: c['_score'], reverse=True)
+    candidates_to_score.sort(key=lambda c: c['_score'], reverse=True)
 
-    best = candidates[0]
+    if not candidates_to_score:
+        return None
+
+    best = candidates_to_score[0]
     print(f"[StreamSelect] Best: {best['height']}p, combined={best['has_both']}, "
           f"ext={best['ext']}, bitrate={best['bitrate']}, "
           f"size={best['content_length']}, score={best['_score']}", flush=True)
@@ -1124,127 +1139,114 @@ def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback
     """
     Fetch stream URL for a single video ID.
     Tries backends in order: Piped → Innertube → Invidious → yt-dlp (per-video).
+    If a backend returns streams but none are playable/valid, falls back to the next.
     """
-    streams = []
-    meta = {}
-    backend_name = None
-
-    # 1. Try Piped (fast proxy, works when their backend is healthy)
-    streams, meta = PipedBackend.get_streams(video_id)
-    if streams:
-        backend_name = 'piped'
-
-    # 2. Try Innertube (direct YouTube API — no third-party dependency)
-    if not streams:
-        streams, meta = InnertubeBackend.get_streams(video_id)
-        if streams:
-            backend_name = 'innertube'
-
-    # 3. Try Invidious
-    if not streams:
-        streams, meta = InvidiousBackend.get_streams(video_id)
-        if streams:
-            backend_name = 'invidious'
-
-    # 4. Try yt-dlp for this specific video ID
-    if not streams:
-        print(f"[Orchestrator] All proxy backends failed for {video_id}, trying yt-dlp...", flush=True)
-        try:
-            import yt_dlp
-            ydl_opts = {
-                'format': 'best[ext=mp4]/bestvideo[ext=mp4][height<=1080]/best',
-                'noplaylist': True,
-                'quiet': True,
-                'no_warnings': True,
-                'nocheckcertificate': True,
-                'geo_bypass': True,
-                'socket_timeout': 15,
-            }
-            cookie_paths = ['/etc/secrets/cookies.txt', '/tmp/yt_cookies.txt', os.path.join(os.getcwd(), 'cookies.txt')]
-            for cp in cookie_paths:
-                if os.path.exists(cp):
-                    # Copy to /tmp to prevent read-only errors since yt-dlp tries to write to the file
-                    tmp_cookie = f'/tmp/ytdlp_cookie_{video_id}.txt'
-                    try:
-                        import shutil
-                        shutil.copy2(cp, tmp_cookie)
-                        ydl_opts['cookiefile'] = tmp_cookie
-                        break
-                    except Exception:
-                        ydl_opts['cookiefile'] = cp
-                        break
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-                if info:
-                    stream_url = info.get('url')
-                    formats = info.get('formats', [])
-                    if formats and not stream_url:
-                        best = select_best_stream(
-                            [{'url': f.get('url'), 'height': f.get('height', 0),
-                              'width': f.get('width', 0),
-                              'bitrate': (f.get('tbr') or 0) * 1000,
-                              'mimeType': f.get('ext', 'mp4'),
-                              'videoOnly': f.get('vcodec', 'none') != 'none' and f.get('acodec', 'none') == 'none',
-                              'ext': f.get('ext', 'mp4'),
-                              'fps': f.get('fps'),
-                              'contentLength': f.get('filesize') or f.get('filesize_approx'),
-                              } for f in formats if f.get('url')],
-                            media_type=media_type, quality=quality, max_filesize_mb=max_filesize_mb,
-                        )
-                        if best:
-                            stream_url = best['url']
-
-                    if stream_url:
-                        fm = fallback_meta or {}
-                        return _build_result(
-                            title=info.get('title', fm.get('title', '')),
-                            video_id=video_id,
-                            stream={
-                                'url': stream_url,
-                                'height': info.get('height', 0),
-                                'width': info.get('width', 0),
-                                'ext': info.get('ext', 'mp4'),
-                                'fps': info.get('fps'),
-                                'content_length': info.get('filesize') or info.get('filesize_approx'),
-                                'has_both': True,
-                            },
-                            duration_secs=parse_duration(info.get('duration')),
-                            thumbnail=info.get('thumbnail', ''),
-                            channel=info.get('uploader', ''),
-                            upload_date=info.get('upload_date', ''),
-                            view_count=info.get('view_count'),
-                            backend_name='yt-dlp',
-                        )
-        except Exception as e:
-            print(f"[yt-dlp] Per-video extraction failed for {video_id}: {e}", flush=True)
-
-    if not streams:
-        return None
-
-    best = select_best_stream(streams, media_type=media_type, quality=quality, max_filesize_mb=max_filesize_mb)
-    if not best:
-        return None
-
     fm = fallback_meta or {}
-    title = meta.get('title') or fm.get('title', '')
-    duration = parse_duration(meta.get('duration') or fm.get('duration', 0))
-    thumbnail = meta.get('thumbnail') or fm.get('thumbnail', '')
-    channel = meta.get('channel') or fm.get('channel', '')
-    upload_date = meta.get('upload_date', '')
-    views = meta.get('views') or fm.get('views')
+    
+    # Define proxies in order
+    backends = [
+        ('piped', PipedBackend),
+        ('innertube', InnertubeBackend),
+        ('invidious', InvidiousBackend),
+    ]
 
-    return _build_result(
-        title=title,
-        video_id=video_id,
-        stream=best,
-        duration_secs=duration,
-        thumbnail=thumbnail,
-        channel=channel,
-        upload_date=upload_date,
-        view_count=views,
-        backend_name=backend_name,
-    )
+    for b_name, b_class in backends:
+        streams, meta = b_class.get_streams(video_id)
+        if not streams:
+            continue
+            
+        best = select_best_stream(streams, media_type=media_type, quality=quality, max_filesize_mb=max_filesize_mb)
+        if best:
+            title = meta.get('title') or fm.get('title', '')
+            duration = parse_duration(meta.get('duration') or fm.get('duration', 0))
+            thumbnail = meta.get('thumbnail') or fm.get('thumbnail', '')
+            channel = meta.get('channel') or fm.get('channel', '')
+            upload_date = meta.get('upload_date', '')
+            views = meta.get('views') or fm.get('views')
+
+            return _build_result(
+                title=title,
+                video_id=video_id,
+                stream=best,
+                duration_secs=duration,
+                thumbnail=thumbnail,
+                channel=channel,
+                upload_date=upload_date,
+                view_count=views,
+                backend_name=b_name,
+            )
+
+    # 4. Try yt-dlp per-video if all proxies fail or return invalid streams
+    print(f"[Orchestrator] All proxy backends failed for {video_id}, trying yt-dlp...", flush=True)
+    try:
+        import yt_dlp
+        ydl_opts = {
+            'format': 'best[ext=mp4]/bestvideo[ext=mp4][height<=1080]/best',
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            'geo_bypass': True,
+            'socket_timeout': 15,
+        }
+        cookie_paths = ['/etc/secrets/cookies.txt', '/tmp/yt_cookies.txt', os.path.join(os.getcwd(), 'cookies.txt')]
+        for cp in cookie_paths:
+            if os.path.exists(cp):
+                tmp_cookie = f'/tmp/ytdlp_cookie_{video_id}.txt'
+                try:
+                    import shutil
+                    shutil.copy2(cp, tmp_cookie)
+                    ydl_opts['cookiefile'] = tmp_cookie
+                    break
+                except Exception:
+                    ydl_opts['cookiefile'] = cp
+                    break
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            if info:
+                stream_url = info.get('url')
+                formats = info.get('formats', [])
+                if formats and not stream_url:
+                    best = select_best_stream(
+                        [{'url': f.get('url'), 'height': f.get('height', 0),
+                          'width': f.get('width', 0),
+                          'bitrate': (f.get('tbr') or 0) * 1000,
+                          'mimeType': f.get('ext', 'mp4'),
+                          'videoOnly': f.get('vcodec', 'none') != 'none' and f.get('acodec', 'none') == 'none',
+                          'ext': f.get('ext', 'mp4'),
+                          'fps': f.get('fps'),
+                          'contentLength': f.get('filesize') or f.get('filesize_approx'),
+                          } for f in formats if f.get('url')],
+                        media_type=media_type, quality=quality, max_filesize_mb=max_filesize_mb,
+                    )
+                    if best:
+                        stream_url = best['url']
+
+                if stream_url:
+                    return _build_result(
+                        title=info.get('title', fm.get('title', '')),
+                        video_id=video_id,
+                        stream={
+                            'url': stream_url,
+                            'height': info.get('height', 0),
+                            'width': info.get('width', 0),
+                            'ext': info.get('ext', 'mp4'),
+                            'fps': info.get('fps'),
+                            'content_length': info.get('filesize') or info.get('filesize_approx'),
+                            'has_both': True,
+                        },
+                        duration_secs=parse_duration(info.get('duration')),
+                        thumbnail=info.get('thumbnail', ''),
+                        channel=info.get('uploader', ''),
+                        upload_date=info.get('upload_date', ''),
+                        view_count=info.get('view_count'),
+                        backend_name='yt-dlp',
+                    )
+    except Exception as e:
+        print(f"[yt-dlp] Per-video extraction failed for {video_id}: {e}", flush=True)
+
+    return None
 
 
 def _extract_video_id(url):
