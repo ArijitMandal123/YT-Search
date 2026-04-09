@@ -17,10 +17,11 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────────
 
 PIPED_INSTANCES = [
-    # private.coffee is the most reliable instance.
-    # DO NOT add dead instances here — each one wastes BACKEND_TIMEOUT seconds
-    # on failure, and Render cold start + timeouts can exceed n8n's 60s limit.
+    # private.coffee is the gold standard (99% uptime).
     "https://api.piped.private.coffee",
+    # Reliable failover instances.
+    "https://api-piped.mha.fi",
+    "https://piped-api.hostux.net",
 ]
 
 INVIDIOUS_INSTANCES = [
@@ -30,9 +31,8 @@ INVIDIOUS_INSTANCES = [
 ]
 
 # Timeout for each backend HTTP call (seconds).
-# Keep this LOW — Render free tier cold-starts take ~30-50s, and n8n has a 60s
-# request timeout, so we can't afford wasting time on slow/dead instances.
-BACKEND_TIMEOUT = 8
+# Reduced to 5s to ensure we can try multiple backends even during a 30s cold start.
+BACKEND_TIMEOUT = 5
 
 # ─────────────────────────────────────────────────────────────
 # Utility helpers
@@ -530,7 +530,7 @@ class YtDlpBackend:
             'extract_flat': False,
             'nocheckcertificate': True,
             'geo_bypass': True,
-            'socket_timeout': 15,
+            'socket_timeout': 8,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             },
@@ -634,6 +634,10 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     Try backends in order: Piped → Invidious → yt-dlp.
     Returns (results_list, error_string_or_None).
     """
+    start_time = time.time()
+    def elapsed():
+        return time.time() - start_time
+
     max_results = kwargs.get('max_results', 1)
     media_type = kwargs.get('type', 'video')
     quality = kwargs.get('quality', 'best')
@@ -658,27 +662,33 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     search_results = []
     search_backend = None
 
-    # Try Piped search — always fetch many candidates regardless of max_results,
-    # because we re-rank by view count and the best video may not be #1 in Piped.
-    search_results = PipedBackend.search(query, max_results=max(max_results, 10))
-    if search_results:
-        search_backend = 'piped'
+    # Check time budget before starting search
+    if elapsed() < 40:
+        # Try Piped search
+        search_results = PipedBackend.search(query, max_results=max(max_results, 10))
+        if search_results:
+            search_backend = 'piped'
 
-    # Try Invidious search
-    if not search_results:
+    # Try Invidious search if Piped failed and time budget allows
+    if not search_results and elapsed() < 45:
         search_results = InvidiousBackend.search(query, max_results=max(max_results, 10))
         if search_results:
             search_backend = 'invidious'
 
-    # Last resort: yt-dlp search
-    if not search_results:
-        print("[Orchestrator] All proxy searches failed, trying yt-dlp fallback...", flush=True)
+    # Last resort: yt-dlp search (Disabled on Render for search due to blocks/slowness)
+    is_on_render = os.environ.get('RENDER') or os.environ.get('PORT') == '7860'
+    if not search_results and not is_on_render and elapsed() < 45:
+        print("[Orchestrator] Proxy searches failed, trying yt-dlp fallback...", flush=True)
         results = YtDlpBackend.search_and_extract(query, max_results=max_results, is_direct_url=False, **kwargs)
         if results:
             return results, None
-        return [], "All backends failed to find results"
 
-    print(f"[Orchestrator] Search phase done via {search_backend}: {len(search_results)} candidates", flush=True)
+    if not search_results:
+        if elapsed() >= 45:
+            return [], "Search timed out (cold start or proxy delays). Please try again."
+        return [], "All search backends failed to find results"
+
+    print(f"[Orchestrator] Search done via {search_backend} in {elapsed():.1f}s: {len(search_results)} candidates", flush=True)
 
     # ── Phase 2: Filter search results by duration ──
     filtered = []
@@ -702,6 +712,11 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     for sr in filtered:
         if len(final_results) >= max_results:
             break
+        
+        # Check time budget: if we are over 50s, return what we have
+        if elapsed() > 50:
+            print(f"[Orchestrator] Time budget reached (50s). Returning {len(final_results)} results.", flush=True)
+            break
 
         video_id = sr['videoId']
         result = _fetch_single_video(
@@ -714,11 +729,15 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     if final_results:
         return final_results, None
 
-    # Absolute last resort
-    print("[Orchestrator] Stream extraction failed for all candidates, trying yt-dlp...", flush=True)
-    results = YtDlpBackend.search_and_extract(query, max_results=max_results, is_direct_url=False, **kwargs)
-    if results:
-        return results, None
+    # Final fallback logic
+    if elapsed() > 50:
+        return [], "Timed out extracting streams. Please try again."
+
+    print("[Orchestrator] Stream extraction failed for all candidates, trying yt-dlp check...", flush=True)
+    if not is_on_render:
+        results = YtDlpBackend.search_and_extract(query, max_results=max_results, is_direct_url=False, **kwargs)
+        if results:
+            return results, None
 
     return [], "Found videos but could not extract stream URLs from any backend"
 

@@ -12,4 +12,5 @@ ENV PORT=7860
 
 # Increased timeout to 120s (was default 30s) to handle slow proxy responses.
 # 2 workers for better concurrency on free tier.
-CMD gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 2 --log-file - --log-level info
+# --preload speeds up worker startup by loading the app before forking.
+CMD gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 2 --preload --log-file - --log-level info
