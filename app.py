@@ -320,9 +320,22 @@ class PipedBackend:
                         'views': item.get('views', 0),
                     })
                 if results:
-                    # Re-rank by view count: most-viewed videos tend to be
-                    # higher quality and more relevant for background footage
-                    results.sort(key=lambda r: r.get('views', 0), reverse=True)
+                    # Re-rank by relevance (title match) and slightly by view count
+                    query_words = set(query.lower().split())
+                    def _relevance_score(r):
+                        s = 0
+                        title = r.get('title', '').lower()
+                        title_words = set(title.split())
+                        # Points for matching words
+                        s += len(query_words.intersection(title_words)) * 2
+                        # Points for full query match
+                        if query.lower() in title:
+                            s += 5
+                        # Small tiebreaker for views
+                        s += min(r.get('views', 0) / 1000000.0, 1.5)
+                        return s
+                    
+                    results.sort(key=_relevance_score, reverse=True)
                     print(f"[Piped] Found {len(results)} results from {base}", flush=True)
                     for i, r in enumerate(results[:5]):
                         try:
@@ -611,7 +624,21 @@ class YtDlpBackend:
 
         import tempfile
         writable_cookie = os.path.join(tempfile.gettempdir(), 'yt_cookies.txt')
-        cookie_paths = ['/etc/secrets/cookies.txt', writable_cookie, os.path.join(os.getcwd(), 'cookies.txt')]
+        cookie_paths = []
+        
+        # If cookies were passed directly into the request from n8n
+        passed_cookies = kwargs.get('cookies_content')
+        if passed_cookies:
+            try:
+                with open(writable_cookie, 'w', encoding='utf-8') as f:
+                    f.write(passed_cookies)
+                cookie_paths.append(writable_cookie)
+                print("[yt-dlp] Using cookies provided in API payload!", flush=True)
+            except Exception as e:
+                print(f"[yt-dlp] Failed to write API payload cookies: {e}")
+        
+        # Fallback to local disk paths
+        cookie_paths.extend(['/etc/secrets/cookies.txt', writable_cookie, os.path.join(os.getcwd(), 'cookies.txt')])
         
         for cp in cookie_paths:
             if os.path.exists(cp):
@@ -813,7 +840,7 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
         video_id = sr['videoId']
         result = _fetch_single_video(
             video_id, media_type, quality, max_filesize_mb,
-            fallback_meta=sr
+            fallback_meta=sr, **kwargs
         )
         if result:
             final_results.append(result)
@@ -828,7 +855,7 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     return [], "Found videos but could not extract stream URLs from any backend"
 
 
-def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback_meta=None):
+def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback_meta=None, **kwargs):
     """Fetch stream URL for a single video ID, trying Piped then Invidious then yt-dlp."""
     # Try Piped streams
     streams, meta = PipedBackend.get_streams(video_id)
@@ -854,9 +881,11 @@ def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback
 
         print(f"[_fetch_single_video] Proxy streams failed for {video_id}, trying yt-dlp direct URL...", flush=True)
         yt_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        kw = {k: v for k, v in kwargs.items() if k != 'max_results'}
         yt_results = YtDlpBackend.search_and_extract(
             yt_url, max_results=1, is_direct_url=True,
-            type=media_type, quality=quality, max_filesize_mb=max_filesize_mb
+            type=media_type, quality=quality, max_filesize_mb=max_filesize_mb, **kw
         )
         if yt_results:
             print(f"[_fetch_single_video] yt-dlp direct URL succeeded for {video_id}", flush=True)
@@ -970,6 +999,7 @@ def search_youtube():
         'prefer_format': data.get('prefer_format'),
         'max_filesize_mb': data.get('max_filesize_mb'),
         'quality': data.get('quality', 'best'),
+        'cookies_content': data.get('cookies_content'),
     }
 
     is_direct_url = query.startswith('http://') or query.startswith('https://')
