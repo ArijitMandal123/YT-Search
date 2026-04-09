@@ -17,21 +17,22 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────────
 
 PIPED_INSTANCES = [
-    # private.coffee is the only consistently reliable instance (99.8% uptime).
-    # Put it first to avoid wasting time on broken instances.
+    # private.coffee is the most reliable instance.
+    # DO NOT add dead instances here — each one wastes BACKEND_TIMEOUT seconds
+    # on failure, and Render cold start + timeouts can exceed n8n's 60s limit.
     "https://api.piped.private.coffee",
-    "https://pipedapi.kavin.rocks",
 ]
 
 INVIDIOUS_INSTANCES = [
     "https://inv.nadeko.net",
     "https://invidious.nerdvpn.de",
-    "https://inv.thepixora.com",
     "https://yewtu.be",
 ]
 
-# Timeout for each backend HTTP call (seconds)
-BACKEND_TIMEOUT = 15
+# Timeout for each backend HTTP call (seconds).
+# Keep this LOW — Render free tier cold-starts take ~30-50s, and n8n has a 60s
+# request timeout, so we can't afford wasting time on slow/dead instances.
+BACKEND_TIMEOUT = 8
 
 # ─────────────────────────────────────────────────────────────
 # Utility helpers
@@ -237,9 +238,9 @@ class PipedBackend:
 
     @staticmethod
     def _get_instance():
-        instances = list(PIPED_INSTANCES)
-        random.shuffle(instances)
-        return instances
+        # NO shuffle — order matters. Reliable instances go first to avoid
+        # wasting timeout seconds on dead ones (critical for n8n 60s limit).
+        return list(PIPED_INSTANCES)
 
     @staticmethod
     def search(query, max_results=5, **kwargs):
@@ -339,9 +340,7 @@ class InvidiousBackend:
 
     @staticmethod
     def _get_instance():
-        instances = list(INVIDIOUS_INSTANCES)
-        random.shuffle(instances)
-        return instances
+        return list(INVIDIOUS_INSTANCES)
 
     @staticmethod
     def search(query, max_results=5, **kwargs):
@@ -859,6 +858,18 @@ def search_youtube():
         "search_method": "multi_backend",
         "results": results,
     })
+
+
+# ─────────────────────────────────────────────────────────────
+# Health / keepalive endpoint
+# Ping this every 5-10 min from cron-job.org or similar to prevent
+# Render free-tier cold starts (which add 30-50s to first request).
+# ─────────────────────────────────────────────────────────────
+
+@app.route('/health', methods=['GET'])
+@app.route('/ping', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"}), 200
 
 
 # ─────────────────────────────────────────────────────────────
