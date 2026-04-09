@@ -732,17 +732,11 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     if elapsed() > 50:
         return [], "Timed out extracting streams. Please try again."
 
-    print("[Orchestrator] Stream extraction failed for all candidates, trying yt-dlp check...", flush=True)
-    if not is_on_render:
-        results = YtDlpBackend.search_and_extract(query, max_results=max_results, is_direct_url=False, **kwargs)
-        if results:
-            return results, None
-
     return [], "Found videos but could not extract stream URLs from any backend"
 
 
 def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback_meta=None):
-    """Fetch stream URL for a single video ID, trying Piped then Invidious."""
+    """Fetch stream URL for a single video ID, trying Piped then Invidious then yt-dlp."""
     # Try Piped streams
     streams, meta = PipedBackend.get_streams(video_id)
     backend_name = 'piped'
@@ -750,11 +744,28 @@ def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback
         streams, meta = InvidiousBackend.get_streams(video_id)
         backend_name = 'invidious'
 
-    if not streams:
-        return None
+    best = None
+    if streams:
+        best = select_best_stream(streams, media_type=media_type, quality=quality, max_filesize_mb=max_filesize_mb)
 
-    best = select_best_stream(streams, media_type=media_type, quality=quality, max_filesize_mb=max_filesize_mb)
+    # ── yt-dlp stream-only fallback (always enabled, even on Render) ──
+    # We already have the video ID from the proxy search. Fetching a single known
+    # direct URL with yt-dlp is fast (~5-10s) and bypasses YouTube's search blocks.
     if not best:
+        print(f"[_fetch_single_video] Proxy streams failed for {video_id}, trying yt-dlp direct URL...", flush=True)
+        yt_url = f"https://www.youtube.com/watch?v={video_id}"
+        yt_results = YtDlpBackend.search_and_extract(
+            yt_url, max_results=1, is_direct_url=True,
+            type=media_type, quality=quality, max_filesize_mb=max_filesize_mb
+        )
+        if yt_results:
+            print(f"[_fetch_single_video] yt-dlp direct URL succeeded for {video_id}", flush=True)
+            # Merge fallback_meta (view count, etc.) into the yt-dlp result
+            if fallback_meta:
+                r = yt_results[0]
+                r.setdefault('view_count', fallback_meta.get('views'))
+                r.setdefault('thumbnail', fallback_meta.get('thumbnail', ''))
+            return yt_results[0]
         return None
 
     # Use meta from stream extraction, fallback to search meta
