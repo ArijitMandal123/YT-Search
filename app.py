@@ -215,9 +215,10 @@ def select_best_stream(streams, media_type='video', quality='best', max_filesize
     def _score(c, filesize_limit=None):
         score = 0
 
-        # === Tier 1: Prefer combined audio+video (but allow high-res video-only to win) ===
+        # === Tier 1: Strongly prefer combined audio+video ===
+        # If the stream is silent (no audio), it requires muxing via ffmpeg. n8n pipelines need a fully playable URL.
         if c['has_both']:
-            score += 3000
+            score += 50000
 
         # === Tier 2: Resolution matching ===
         if media_type == 'video':
@@ -596,7 +597,201 @@ def _extract_width(s):
 
 
 # ─────────────────────────────────────────────────────────────
-# Backend 3: yt-dlp fallback (last resort)
+# Backend 3: Direct YouTube Innertube API
+# ─────────────────────────────────────────────────────────────
+
+class InnertubeBackend:
+    """
+    Direct YouTube innertube API client — no third-party proxy needed.
+    Calls YouTube's /youtubei/v1/player endpoint with various client
+    configurations to get stream URLs. This is the same API that
+    Piped, Invidious, and yt-dlp use internally.
+    """
+    name = "innertube"
+
+    # Client configurations ordered by reliability (2025-2026)
+    CLIENTS = [
+        {
+            "name": "ANDROID_VR",
+            "payload": {
+                "context": {
+                    "client": {
+                        "clientName": "ANDROID_VR",
+                        "clientVersion": "1.57.29",
+                        "androidSdkVersion": 30,
+                        "hl": "en",
+                        "gl": "US",
+                    }
+                },
+            },
+            "headers": {
+                "Content-Type": "application/json",
+                "User-Agent": "com.google.android.apps.youtube.vr.oculus/1.57.29 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+            },
+        },
+        {
+            "name": "ANDROID_TESTSUITE",
+            "payload": {
+                "context": {
+                    "client": {
+                        "clientName": "ANDROID_TESTSUITE",
+                        "clientVersion": "1.9",
+                        "androidSdkVersion": 30,
+                        "hl": "en",
+                        "gl": "US",
+                        "platform": "MOBILE",
+                    }
+                },
+            },
+            "headers": {
+                "Content-Type": "application/json",
+                "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+                "X-YouTube-Client-Name": "30",
+                "X-YouTube-Client-Version": "1.9",
+            },
+        },
+        {
+            "name": "MWEB",
+            "payload": {
+                "context": {
+                    "client": {
+                        "clientName": "MWEB",
+                        "clientVersion": "2.20240304.08.00",
+                        "hl": "en",
+                        "gl": "US",
+                    }
+                },
+            },
+            "headers": {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+                "Referer": "https://m.youtube.com/",
+                "Origin": "https://m.youtube.com",
+            },
+        },
+    ]
+
+    INNERTUBE_API_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"
+
+    @staticmethod
+    def get_streams(video_id):
+        """Get stream URLs directly from YouTube's innertube player API."""
+        for client_cfg in InnertubeBackend.CLIENTS:
+            client_name = client_cfg["name"]
+            try:
+                url = f"https://www.youtube.com/youtubei/v1/player?key={InnertubeBackend.INNERTUBE_API_KEY}"
+                payload = dict(client_cfg["payload"])
+                payload["videoId"] = video_id
+                payload["playbackContext"] = {
+                    "contentPlaybackContext": {
+                        "html5Preference": "HTML5_PREF_WANTS",
+                    }
+                }
+                payload["contentCheckOk"] = True
+                payload["racyCheckOk"] = True
+
+                headers = dict(client_cfg["headers"])
+                print(f"[Innertube] Trying {client_name} for {video_id}", flush=True)
+
+                r = http_requests.post(url, json=payload, headers=headers, timeout=15)
+                if r.status_code != 200:
+                    print(f"[Innertube] {client_name} returned HTTP {r.status_code}", flush=True)
+                    continue
+
+                data = r.json()
+                playability = data.get("playabilityStatus", {})
+                status = playability.get("status", "")
+
+                if status != "OK":
+                    reason = playability.get("reason", playability.get("messages", ["unknown"]))
+                    print(f"[Innertube] {client_name} playability: {status} - {reason}", flush=True)
+                    continue
+
+                streaming_data = data.get("streamingData", {})
+                all_streams = []
+
+                # "formats" = combined audio+video (lower quality, usually 360p/720p)
+                for f in streaming_data.get("formats", []):
+                    stream_url = f.get("url")
+                    # Skip streams that need signature decryption
+                    if not stream_url and f.get("signatureCipher"):
+                        continue
+                    if not stream_url:
+                        continue
+                    all_streams.append({
+                        "url": stream_url,
+                        "mimeType": f.get("mimeType", "video/mp4"),
+                        "height": f.get("height", 0),
+                        "width": f.get("width", 0),
+                        "bitrate": f.get("bitrate", 0),
+                        "contentLength": f.get("contentLength"),
+                        "qualityLabel": f.get("qualityLabel", ""),
+                        "videoOnly": False,  # "formats" always have audio+video
+                        "fps": f.get("fps"),
+                    })
+
+                # "adaptiveFormats" = separate audio and video (high quality)
+                for f in streaming_data.get("adaptiveFormats", []):
+                    stream_url = f.get("url")
+                    if not stream_url and f.get("signatureCipher"):
+                        continue
+                    if not stream_url:
+                        continue
+                    mime = f.get("mimeType", "")
+                    is_video = "video" in mime
+                    has_audio_quality = bool(f.get("audioQuality"))
+                    all_streams.append({
+                        "url": stream_url,
+                        "mimeType": mime,
+                        "height": f.get("height", 0),
+                        "width": f.get("width", 0),
+                        "bitrate": f.get("bitrate", 0),
+                        "contentLength": f.get("contentLength"),
+                        "qualityLabel": f.get("qualityLabel", ""),
+                        "videoOnly": is_video and not has_audio_quality,
+                        "audioQuality": f.get("audioQuality", ""),
+                        "fps": f.get("fps"),
+                    })
+
+                video_details = data.get("videoDetails", {})
+                thumbs = video_details.get("thumbnail", {}).get("thumbnails", [])
+                thumb_url = thumbs[-1].get("url", "") if thumbs else ""
+
+                meta = {
+                    "title": video_details.get("title", ""),
+                    "duration": int(video_details.get("lengthSeconds", 0)),
+                    "thumbnail": thumb_url,
+                    "channel": video_details.get("author", ""),
+                    "upload_date": "",
+                    "views": int(video_details.get("viewCount", 0)),
+                }
+
+                if all_streams:
+                    combined = sum(1 for s in all_streams if not s.get("videoOnly", True) and "video" in s.get("mimeType", ""))
+                    video_only = sum(1 for s in all_streams if s.get("videoOnly"))
+                    audio_only = sum(1 for s in all_streams if "audio" in s.get("mimeType", "") and not s.get("height"))
+                    print(f"[Innertube] {client_name} got {len(all_streams)} streams "
+                          f"(combined={combined}, video-only={video_only}, audio={audio_only})", flush=True)
+                    return all_streams, meta
+                else:
+                    # Check if we got an HLS manifest
+                    hls = streaming_data.get("hlsManifestUrl")
+                    if hls:
+                        print(f"[Innertube] {client_name} using HLS manifest", flush=True)
+                        return [{"url": hls, "mimeType": "video/mp4", "height": 720,
+                                 "width": 1280, "bitrate": 0, "videoOnly": False}], meta
+                    print(f"[Innertube] {client_name} got response but no usable stream URLs "
+                          f"(may need signature decryption)", flush=True)
+
+            except Exception as e:
+                print(f"[Innertube] {client_name} error: {e}", flush=True)
+                continue
+
+        return [], {}
+
+
+# ─────────────────────────────────────────────────────────────
+# Backend 4: yt-dlp fallback (last resort)
 # ─────────────────────────────────────────────────────────────
 
 class YtDlpBackend:
@@ -922,12 +1117,95 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
 
 
 def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback_meta=None):
-    """Fetch stream URL for a single video ID, trying Piped then Invidious."""
+    """
+    Fetch stream URL for a single video ID.
+    Tries backends in order: Piped → Innertube → Invidious → yt-dlp (per-video).
+    """
+    streams = []
+    meta = {}
+    backend_name = None
+
+    # 1. Try Piped (fast proxy, works when their backend is healthy)
     streams, meta = PipedBackend.get_streams(video_id)
-    backend_name = 'piped'
+    if streams:
+        backend_name = 'piped'
+
+    # 2. Try Innertube (direct YouTube API — no third-party dependency)
+    if not streams:
+        streams, meta = InnertubeBackend.get_streams(video_id)
+        if streams:
+            backend_name = 'innertube'
+
+    # 3. Try Invidious
     if not streams:
         streams, meta = InvidiousBackend.get_streams(video_id)
-        backend_name = 'invidious'
+        if streams:
+            backend_name = 'invidious'
+
+    # 4. Try yt-dlp for this specific video ID
+    if not streams:
+        print(f"[Orchestrator] All proxy backends failed for {video_id}, trying yt-dlp...", flush=True)
+        try:
+            import yt_dlp
+            ydl_opts = {
+                'format': 'best[ext=mp4]/bestvideo[ext=mp4][height<=1080]/best',
+                'noplaylist': True,
+                'quiet': True,
+                'no_warnings': True,
+                'nocheckcertificate': True,
+                'geo_bypass': True,
+                'socket_timeout': 15,
+            }
+            cookie_paths = ['/etc/secrets/cookies.txt', '/tmp/yt_cookies.txt', os.path.join(os.getcwd(), 'cookies.txt')]
+            for cp in cookie_paths:
+                if os.path.exists(cp):
+                    ydl_opts['cookiefile'] = cp
+                    break
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                if info:
+                    stream_url = info.get('url')
+                    formats = info.get('formats', [])
+                    if formats and not stream_url:
+                        best = select_best_stream(
+                            [{'url': f.get('url'), 'height': f.get('height', 0),
+                              'width': f.get('width', 0),
+                              'bitrate': (f.get('tbr') or 0) * 1000,
+                              'mimeType': f.get('ext', 'mp4'),
+                              'videoOnly': f.get('vcodec', 'none') != 'none' and f.get('acodec', 'none') == 'none',
+                              'ext': f.get('ext', 'mp4'),
+                              'fps': f.get('fps'),
+                              'contentLength': f.get('filesize') or f.get('filesize_approx'),
+                              } for f in formats if f.get('url')],
+                            media_type=media_type, quality=quality, max_filesize_mb=max_filesize_mb,
+                        )
+                        if best:
+                            stream_url = best['url']
+
+                    if stream_url:
+                        fm = fallback_meta or {}
+                        return _build_result(
+                            title=info.get('title', fm.get('title', '')),
+                            video_id=video_id,
+                            stream={
+                                'url': stream_url,
+                                'height': info.get('height', 0),
+                                'width': info.get('width', 0),
+                                'ext': info.get('ext', 'mp4'),
+                                'fps': info.get('fps'),
+                                'content_length': info.get('filesize') or info.get('filesize_approx'),
+                                'has_both': True,
+                            },
+                            duration_secs=parse_duration(info.get('duration')),
+                            thumbnail=info.get('thumbnail', ''),
+                            channel=info.get('uploader', ''),
+                            upload_date=info.get('upload_date', ''),
+                            view_count=info.get('view_count'),
+                            backend_name='yt-dlp',
+                        )
+        except Exception as e:
+            print(f"[yt-dlp] Per-video extraction failed for {video_id}: {e}", flush=True)
 
     if not streams:
         return None
