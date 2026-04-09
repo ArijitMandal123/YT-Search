@@ -220,6 +220,10 @@ def select_best_stream(streams, media_type='video', quality='best', max_filesize
         if c['has_both']:
             score += 50000
 
+        # === Tier 1.5: Reject dummy 0p streams for video requests ===
+        if media_type == 'video' and c['height'] == 0:
+            score -= 100000
+
         # === Tier 2: Resolution matching ===
         if media_type == 'video':
             if quality == 'best':
@@ -377,7 +381,7 @@ class PipedBackend:
             try:
                 url = f"{base}/streams/{video_id}"
                 print(f"[Piped] Getting streams: {url}", flush=True)
-                r = http_requests.get(url, timeout=BACKEND_TIMEOUT)
+                r = http_requests.get(url, timeout=5)
                 if r.status_code != 200:
                     print(f"[Piped] {base} streams returned {r.status_code}", flush=True)
                     continue
@@ -453,7 +457,7 @@ class InvidiousBackend:
             try:
                 url = f"{base}/api/v1/search?q={urllib.parse.quote(query)}&type=video&sort_by=relevance"
                 print(f"[Invidious] Searching: {url}", flush=True)
-                r = http_requests.get(url, timeout=BACKEND_TIMEOUT)
+                r = http_requests.get(url, timeout=5)
                 if r.status_code != 200:
                     print(f"[Invidious] {base} returned {r.status_code}", flush=True)
                     continue
@@ -693,7 +697,7 @@ class InnertubeBackend:
                 headers = dict(client_cfg["headers"])
                 print(f"[Innertube] Trying {client_name} for {video_id}", flush=True)
 
-                r = http_requests.post(url, json=payload, headers=headers, timeout=15)
+                r = http_requests.post(url, json=payload, headers=headers, timeout=5)
                 if r.status_code != 200:
                     print(f"[Innertube] {client_name} returned HTTP {r.status_code}", flush=True)
                     continue
@@ -1159,8 +1163,16 @@ def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback
             cookie_paths = ['/etc/secrets/cookies.txt', '/tmp/yt_cookies.txt', os.path.join(os.getcwd(), 'cookies.txt')]
             for cp in cookie_paths:
                 if os.path.exists(cp):
-                    ydl_opts['cookiefile'] = cp
-                    break
+                    # Copy to /tmp to prevent read-only errors since yt-dlp tries to write to the file
+                    tmp_cookie = f'/tmp/ytdlp_cookie_{video_id}.txt'
+                    try:
+                        import shutil
+                        shutil.copy2(cp, tmp_cookie)
+                        ydl_opts['cookiefile'] = tmp_cookie
+                        break
+                    except Exception:
+                        ydl_opts['cookiefile'] = cp
+                        break
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
