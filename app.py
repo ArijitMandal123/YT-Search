@@ -617,7 +617,7 @@ class YtDlpBackend:
             },
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['web_creator', 'ios', 'web'],
+                    'player_client': ['ios', 'android', 'web'],
                 },
             },
         }
