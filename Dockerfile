@@ -10,4 +10,6 @@ COPY . .
 # Default to 7860 for Hugging Face Spaces, Render will override this with its own PORT
 ENV PORT=7860
 
-CMD gunicorn app:app --bind 0.0.0.0:$PORT --log-file -
+# Increased timeout to 120s (was default 30s) to handle slow proxy responses.
+# 2 workers for better concurrency on free tier.
+CMD gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 2 --log-file - --log-level info
