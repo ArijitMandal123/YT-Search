@@ -1019,7 +1019,7 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     Ranks results by relevance to query before extracting streams.
     Returns (results_list, error_string_or_None).
     """
-    max_results = kwargs.get('max_results', 1)
+    max_results = kwargs.pop('max_results', 1)
     media_type = kwargs.get('type', 'video')
     quality = kwargs.get('quality', 'best')
     max_filesize_mb = kwargs.get('max_filesize_mb')
