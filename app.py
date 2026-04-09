@@ -17,11 +17,10 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────────
 
 PIPED_INSTANCES = [
+    # private.coffee is the only consistently reliable instance (99.8% uptime).
+    # Put it first to avoid wasting time on broken instances.
     "https://api.piped.private.coffee",
     "https://pipedapi.kavin.rocks",
-    "https://piped-api.garudalinux.org",
-    "https://piped-api.lunar.icu",
-    "https://pipedapi.in.projectsegfau.lt",
 ]
 
 INVIDIOUS_INSTANCES = [
@@ -68,10 +67,13 @@ def _quality_height(quality_str):
 def select_best_stream(streams, media_type='video', quality='best', max_filesize_mb=None):
     """
     Unified format selector that works across Piped, Invidious, and yt-dlp
-    format lists.  Each stream dict is expected to have at least:
-      - url (str)
-      - optionally: height, width, bitrate, contentLength, mimeType/type,
-        qualityLabel, audioQuality, videoOnly/audioOnly, ext, container
+    format lists.
+
+    DESIGN: For video, we prioritize resolution + bitrate above all else.
+    Video-only streams at 1080p are FAR superior to combined 360p streams.
+    This matches the local fetcher.py approach: 'bestvideo[ext=mp4][height<=1080]'
+    which explicitly picks the highest quality video-only stream.
+
     Returns the single best stream dict, or None.
     """
     if not streams:
@@ -104,6 +106,11 @@ def select_best_stream(streams, media_type='video', quality='best', max_filesize
         if media_type == 'video':
             if not is_video:
                 continue
+            # Skip 0x0 / unknown resolution combined streams — they are
+            # always extremely low-quality progressive downloads.
+            height = int(s.get('height') or 0)
+            if has_both and height == 0:
+                continue
         elif media_type == 'audio':
             if not is_audio:
                 continue
@@ -131,29 +138,52 @@ def select_best_stream(streams, media_type='video', quality='best', max_filesize
 
     def _score(c):
         score = 0
-        # Strongly prefer combined audio+video
-        if c['has_both']:
-            score += 10000
+
         if media_type == 'video':
+            # ── PRIMARY: Resolution is king ──
+            # Height dominates the score. A 1080p video-only stream is always
+            # better than a 360p combined stream for background-video use.
             if quality == 'best':
-                score += c['height'] * 10 + c['bitrate'] // 1000
+                score += c['height'] * 100 + c['bitrate'] // 1000
             elif quality == 'worst':
-                score -= c['height'] * 10
+                score -= c['height'] * 100
             elif target_h:
-                # Closer to target is better; penalise distance
-                score -= abs(target_h - c['height']) * 10
+                # Closer to target is better; strong penalty for distance
+                score -= abs(target_h - c['height']) * 100
+                # Among same-height, prefer higher bitrate (= better quality)
                 score += c['bitrate'] // 1000
             else:
-                score += c['height'] * 10
+                score += c['height'] * 100
+
+            # ── SECONDARY: Small bonus for combined audio+video ──
+            # Only a tiebreaker — never enough to override a resolution jump.
+            # 500 < one resolution tier (e.g. 720→1080 = 360*100 = 36000)
+            if c['has_both']:
+                score += 500
+
+            # ── TERTIARY: Format preference ──
+            if c['ext'] == 'mp4':
+                score += 200
+            elif c['ext'] == 'm4a':
+                score += 100
+
+            # ── Small bonus for higher fps ──
+            if c.get('fps') and c['fps'] > 30:
+                score += 50
+
         elif media_type == 'audio':
             score += c['bitrate'] // 1000
-        # Prefer mp4/m4a over webm
-        if c['ext'] in ('mp4', 'm4a'):
-            score += 500
+            if c['ext'] in ('mp4', 'm4a'):
+                score += 500
+
         return score
 
     candidates.sort(key=_score, reverse=True)
-    return candidates[0]
+    winner = candidates[0]
+    print(f"[StreamSelect] Picked: {winner['height']}p {winner['ext']} "
+          f"bitrate={winner['bitrate']} videoOnly={winner['video_only']} "
+          f"has_both={winner['has_both']} filesize={winner.get('content_length')}", flush=True)
+    return winner
 
 
 def _guess_ext(mime):
@@ -225,7 +255,7 @@ class PipedBackend:
                 data = r.json()
                 items = data.get('items') or data.get('results') or []
                 results = []
-                for item in items[:max_results * 3]:  # get extra to filter later
+                for item in items[:20]:  # Grab many candidates to rank ourselves
                     vid = item.get('url', '').replace('/watch?v=', '')
                     if not vid or len(vid) != 11:
                         continue
@@ -238,7 +268,12 @@ class PipedBackend:
                         'views': item.get('views', 0),
                     })
                 if results:
+                    # Re-rank by view count: most-viewed videos tend to be
+                    # higher quality and more relevant for background footage
+                    results.sort(key=lambda r: r.get('views', 0), reverse=True)
                     print(f"[Piped] Found {len(results)} results from {base}", flush=True)
+                    for i, r in enumerate(results[:5]):
+                        print(f"  #{i+1} views={r['views']:>10,} dur={r['duration']:>4}s [{r['videoId']}] {r['title'][:60]}", flush=True)
                     return results
             except Exception as e:
                 print(f"[Piped] {base} error: {e}", flush=True)
@@ -624,14 +659,15 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     search_results = []
     search_backend = None
 
-    # Try Piped search
-    search_results = PipedBackend.search(query, max_results=max_results)
+    # Try Piped search — always fetch many candidates regardless of max_results,
+    # because we re-rank by view count and the best video may not be #1 in Piped.
+    search_results = PipedBackend.search(query, max_results=max(max_results, 10))
     if search_results:
         search_backend = 'piped'
 
     # Try Invidious search
     if not search_results:
-        search_results = InvidiousBackend.search(query, max_results=max_results)
+        search_results = InvidiousBackend.search(query, max_results=max(max_results, 10))
         if search_results:
             search_backend = 'invidious'
 
