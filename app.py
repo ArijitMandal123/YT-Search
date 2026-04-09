@@ -16,22 +16,18 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────────
 # Backend Instance Lists (ordered by reliability — best first)
 # ─────────────────────────────────────────────────────────────
-
 PIPED_INSTANCES = [
     "https://api.piped.private.coffee",   # Austria, 100% uptime, proven working
     "https://pipedapi.kavin.rocks",       # Official Piped
-    "https://pipedapi.in.projectsegfau.lt",
 ]
 
 INVIDIOUS_INSTANCES = [
     "https://inv.nadeko.net",
     "https://invidious.nerdvpn.de",
-    "https://inv.thepixora.com",
-    "https://yewtu.be",
 ]
 
 # Timeout for each backend HTTP call (seconds)
-BACKEND_TIMEOUT = 15
+BACKEND_TIMEOUT = 3
 
 # ─────────────────────────────────────────────────────────────
 # Utility helpers
@@ -396,7 +392,7 @@ class PipedBackend:
             try:
                 url = f"{base}/streams/{video_id}"
                 print(f"[Piped] Getting streams: {url}", flush=True)
-                r = http_requests.get(url, timeout=5)
+                r = http_requests.get(url, timeout=BACKEND_TIMEOUT)
                 if r.status_code != 200:
                     print(f"[Piped] {base} streams returned {r.status_code}", flush=True)
                     continue
@@ -472,7 +468,7 @@ class InvidiousBackend:
             try:
                 url = f"{base}/api/v1/search?q={urllib.parse.quote(query)}&type=video&sort_by=relevance"
                 print(f"[Invidious] Searching: {url}", flush=True)
-                r = http_requests.get(url, timeout=5)
+                r = http_requests.get(url, timeout=BACKEND_TIMEOUT)
                 if r.status_code != 200:
                     print(f"[Invidious] {base} returned {r.status_code}", flush=True)
                     continue
@@ -712,7 +708,7 @@ class InnertubeBackend:
                 headers = dict(client_cfg["headers"])
                 print(f"[Innertube] Trying {client_name} for {video_id}", flush=True)
 
-                r = http_requests.post(url, json=payload, headers=headers, timeout=5)
+                r = http_requests.post(url, json=payload, headers=headers, timeout=BACKEND_TIMEOUT)
                 if r.status_code != 200:
                     print(f"[Innertube] {client_name} returned HTTP {r.status_code}", flush=True)
                     continue
@@ -1104,8 +1100,10 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
 
     # ── Phase 4: Get stream URLs for top candidates ──
     final_results = []
-    # Try more candidates to find good quality streams
-    candidates_to_try = min(len(filtered), max(max_results * 3, 5))
+    # Severely limit candidates to prevent Render 100s timeout (502 Bad Gateway)
+    candidates_to_try = max(max_results * 2, 2)
+    if candidates_to_try > len(filtered):
+        candidates_to_try = len(filtered)
 
     for sr in filtered[:candidates_to_try]:
         if len(final_results) >= max_results:
