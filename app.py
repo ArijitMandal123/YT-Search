@@ -17,17 +17,19 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────────
 
 PIPED_INSTANCES = [
-    # private.coffee is the gold standard (99% uptime).
+    # private.coffee is the only reliably working Piped instance (as of 2026-04).
     "https://api.piped.private.coffee",
-    # Reliable failover instances.
-    "https://pipedapi.kavin.rocks",
-    "https://api.piped.projectsegfau.lt",
 ]
 
 INVIDIOUS_INSTANCES = [
-    "https://invidious.jing.rocks",
-    "https://vid.priv.au",
+    # These return 403 frequently but sometimes work — worth a quick try.
+    "https://inv.nadeko.net",
+    "https://yewtu.be",
 ]
+
+# Global flag: if yt-dlp direct-URL extraction has already failed once in
+# this request, don't retry it for every candidate video (saves ~10s each).
+_ytdlp_failed_this_request = False
 
 # Timeout for each backend HTTP call (seconds).
 # Reduced to 5s to ensure we can try multiple backends even during a 30s cold start.
@@ -535,10 +537,20 @@ class YtDlpBackend:
             },
         }
 
-        # Check for cookies
+        # Check for cookies — copy from read-only paths to /tmp first
         cookie_paths = ['/etc/secrets/cookies.txt', '/tmp/yt_cookies.txt', os.path.join(os.getcwd(), 'cookies.txt')]
+        writable_cookie = '/tmp/yt_cookies.txt'
         for cp in cookie_paths:
             if os.path.exists(cp):
+                # If the cookie file is on a read-only FS, copy it to /tmp
+                if cp != writable_cookie:
+                    try:
+                        import shutil
+                        shutil.copy2(cp, writable_cookie)
+                        print(f"[yt-dlp] Copied cookies from {cp} -> {writable_cookie}", flush=True)
+                        cp = writable_cookie
+                    except Exception as copy_err:
+                        print(f"[yt-dlp] Could not copy cookies: {copy_err}", flush=True)
                 ydl_opts['cookiefile'] = cp
                 print(f"[yt-dlp] Using cookies from {cp}", flush=True)
                 break
@@ -662,28 +674,28 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     search_backend = None
 
     # Check time budget before starting search
-    if elapsed() < 40:
+    if elapsed() < 15:
         # Try Piped search
         search_results = PipedBackend.search(query, max_results=max(max_results, 10))
         if search_results:
             search_backend = 'piped'
 
     # Try Invidious search if Piped failed and time budget allows
-    if not search_results and elapsed() < 45:
+    if not search_results and elapsed() < 20:
         search_results = InvidiousBackend.search(query, max_results=max(max_results, 10))
         if search_results:
             search_backend = 'invidious'
 
     # Last resort: yt-dlp search (Disabled on Render for search due to blocks/slowness)
     is_on_render = os.environ.get('RENDER') or os.environ.get('PORT') == '7860'
-    if not search_results and not is_on_render and elapsed() < 45:
+    if not search_results and not is_on_render and elapsed() < 25:
         print("[Orchestrator] Proxy searches failed, trying yt-dlp fallback...", flush=True)
         results = YtDlpBackend.search_and_extract(query, max_results=max_results, is_direct_url=False, **kwargs)
         if results:
             return results, None
 
     if not search_results:
-        if elapsed() >= 45:
+        if elapsed() >= 25:
             return [], "Search timed out (cold start or proxy delays). Please try again."
         return [], "All search backends failed to find results"
 
@@ -707,14 +719,19 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
         filtered = [sr for sr in search_results if parse_duration(sr.get('duration', 0)) > 0]
 
     # ── Phase 3: Get stream URLs for each video ──
+    # Reset the per-request yt-dlp failure flag
+    global _ytdlp_failed_this_request
+    _ytdlp_failed_this_request = False
+
     final_results = []
-    for sr in filtered:
+    # Only try up to 3 candidates to avoid looping through all 20 and timing out
+    for sr in filtered[:3]:
         if len(final_results) >= max_results:
             break
         
-        # Check time budget: if we are over 50s, return what we have
-        if elapsed() > 50:
-            print(f"[Orchestrator] Time budget reached (50s). Returning {len(final_results)} results.", flush=True)
+        # Check time budget: if we are over 35s, return what we have
+        if elapsed() > 35:
+            print(f"[Orchestrator] Time budget reached (35s). Returning {len(final_results)} results.", flush=True)
             break
 
         video_id = sr['videoId']
@@ -729,7 +746,7 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
         return final_results, None
 
     # Final fallback logic
-    if elapsed() > 50:
+    if elapsed() > 35:
         return [], "Timed out extracting streams. Please try again."
 
     return [], "Found videos but could not extract stream URLs from any backend"
@@ -751,7 +768,14 @@ def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback
     # ── yt-dlp stream-only fallback (always enabled, even on Render) ──
     # We already have the video ID from the proxy search. Fetching a single known
     # direct URL with yt-dlp is fast (~5-10s) and bypasses YouTube's search blocks.
+    # BUT: if yt-dlp already failed once this request, don't retry — YouTube is
+    # blocking this server's IP entirely, and retrying just wastes 10s per attempt.
+    global _ytdlp_failed_this_request
     if not best:
+        if _ytdlp_failed_this_request:
+            print(f"[_fetch_single_video] Skipping yt-dlp for {video_id} (already failed this request)", flush=True)
+            return None
+
         print(f"[_fetch_single_video] Proxy streams failed for {video_id}, trying yt-dlp direct URL...", flush=True)
         yt_url = f"https://www.youtube.com/watch?v={video_id}"
         yt_results = YtDlpBackend.search_and_extract(
@@ -766,6 +790,9 @@ def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback
                 r.setdefault('view_count', fallback_meta.get('views'))
                 r.setdefault('thumbnail', fallback_meta.get('thumbnail', ''))
             return yt_results[0]
+        else:
+            _ytdlp_failed_this_request = True
+            print(f"[_fetch_single_video] yt-dlp failed for {video_id}, will skip for remaining candidates", flush=True)
         return None
 
     # Use meta from stream extraction, fallback to search meta
