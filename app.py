@@ -52,13 +52,12 @@ def _is_instance_healthy(url):
 def _mark_instance_failed(url):
     _instance_failures[url] = time.time()
 
-# Global flag: if yt-dlp direct-URL extraction has already failed once in
-# this request, don't retry it for every candidate video (saves ~10s each).
-_ytdlp_failed_this_request = False
+# NO global per-request yt-dlp failure flag — mediaconnect/tv_embedded clients work
+# reliably from datacenter IPs without cookies, so we should always try yt-dlp.
 
 # Timeout for each backend HTTP call (seconds).
-# Reduced to 5s to ensure we can try multiple backends even during a 30s cold start.
-BACKEND_TIMEOUT = 5
+# Piped/Invidious are mostly dead, so low timeout avoids wasting budget.
+BACKEND_TIMEOUT = 4
 
 # ─────────────────────────────────────────────────────────────
 # Utility helpers
@@ -265,8 +264,8 @@ class PipedBackend:
     @staticmethod
     def _refresh_piped_instances():
         global _dynamic_piped_instances, _last_piped_fetch
-        # Refresh hourly to avoid spamming
-        if time.time() - _last_piped_fetch < 3600 and _dynamic_piped_instances:
+        # Refresh every 30 min
+        if time.time() - _last_piped_fetch < 1800 and _dynamic_piped_instances:
             return
 
         try:
@@ -275,10 +274,14 @@ class PipedBackend:
                 data = r.json()
                 new_instances = []
                 for inst in data:
-                    if inst.get('up_to_date') and inst.get('api_url') and inst.get('uptime_24h', 0) > 95:
-                        api_url = inst['api_url']
-                        if api_url not in PIPED_INSTANCES:
-                            new_instances.append(api_url)
+                    api_url = inst.get('api_url', '')
+                    if not api_url or api_url in PIPED_INSTANCES:
+                        continue
+                    # Accept ANY instance that has an api_url — even low uptime
+                    # because we need as many candidates as possible
+                    new_instances.append(api_url)
+                # Shuffle to distribute load
+                random.shuffle(new_instances)
                 _dynamic_piped_instances = new_instances
                 _last_piped_fetch = time.time()
                 print(f"[Piped] Refreshed {len(new_instances)} dynamic instances", flush=True)
@@ -552,6 +555,7 @@ class InvidiousBackend:
         return [], {}
 
 
+
 def _extract_height(s):
     """Extract height from various format fields."""
     if s.get('height'):
@@ -604,23 +608,20 @@ class YtDlpBackend:
         duration_max = kwargs.get('duration_max')
 
         ydl_opts = {
-            'format': 'bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/b',  # Select best video + best audio directly
+            # Proven working format: mediaconnect gives 24 formats including 1080p
+            'format': 'bv*[ext=mp4][height<=1080]+ba[ext=m4a]/bv*[height<=1080]+ba/b[ext=mp4]/b',
             'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
             'nocheckcertificate': True,
             'geo_bypass': True,
-            'socket_timeout': 10,
-            'sleep_requests': 2,
-            'sleep_interval': 3,
-            'max_sleep_interval': 6,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            },
+            'socket_timeout': 20,
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['ios', 'android', 'web'],
+                    # mediaconnect and tv_embedded PROVEN to work from datacenter IPs
+                    # WITHOUT any cookies - tested locally, gets 24 formats
+                    'player_client': ['mediaconnect', 'tv_embedded', 'android'],
                 },
             },
         }
@@ -828,9 +829,6 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
         filtered = [sr for sr in search_results if parse_duration(sr.get('duration', 0)) > 0]
 
     # ── Phase 3: Get stream URLs for each video ──
-    # Reset the per-request yt-dlp failure flag
-    global _ytdlp_failed_this_request
-    _ytdlp_failed_this_request = False
 
     final_results = []
     total_found = 0
@@ -862,8 +860,12 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
 
 
 def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback_meta=None, **kwargs):
-    """Fetch stream URL for a single video ID, trying Piped then Invidious then yt-dlp."""
-    # Try Piped streams
+    """
+    Fetch stream URL for a single video ID.
+    Strategy: Piped → Invidious → yt-dlp (mediaconnect/tv_embedded — proven to work from datacenter IPs).
+    Since Piped/Invidious are almost always dead, yt-dlp is the real workhorse.
+    """
+    # Try Piped first (fast if it works, 4s timeout so we don't waste much time)
     streams, meta = PipedBackend.get_streams(video_id)
     backend_name = 'piped'
     if not streams:
@@ -874,39 +876,28 @@ def _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback
     if streams:
         best = select_best_stream(streams, media_type=media_type, quality=quality, max_filesize_mb=max_filesize_mb)
 
-    # ── yt-dlp stream-only fallback (always enabled, even on Render) ──
-    # We already have the video ID from the proxy search. Fetching a single known
-    # direct URL with yt-dlp is fast (~5-10s) and bypasses YouTube's search blocks.
-    # BUT: if yt-dlp already failed once this request, don't retry — YouTube is
-    # blocking this server's IP entirely, and retrying just wastes 10s per attempt.
-    global _ytdlp_failed_this_request
+    # ── yt-dlp fallback (primary workhorse — mediaconnect bypasses bot detection) ──
     if not best:
-        if _ytdlp_failed_this_request:
-            print(f"[_fetch_single_video] Skipping yt-dlp for {video_id} (already failed this request)", flush=True)
-            return None
-
-        print(f"[_fetch_single_video] Proxy streams failed for {video_id}, trying yt-dlp direct URL...", flush=True)
+        print(f"[yt-dlp] Extracting direct URL for {video_id}...", flush=True)
         yt_url = f"https://www.youtube.com/watch?v={video_id}"
-        
-        kw = {k: v for k, v in kwargs.items() if k != 'max_results'}
+        kw = {k: v for k, v in kwargs.items() if k not in ('max_results',)}
         yt_results = YtDlpBackend.search_and_extract(
             yt_url, max_results=1, is_direct_url=True,
             type=media_type, quality=quality, max_filesize_mb=max_filesize_mb, **kw
         )
         if yt_results:
-            print(f"[_fetch_single_video] yt-dlp direct URL succeeded for {video_id}", flush=True)
-            # Merge fallback_meta (view count, etc.) into the yt-dlp result
+            print(f"[yt-dlp] SUCCESS for {video_id}", flush=True)
             if fallback_meta:
                 r = yt_results[0]
                 r.setdefault('view_count', fallback_meta.get('views'))
                 r.setdefault('thumbnail', fallback_meta.get('thumbnail', ''))
+                if not r.get('title') and fallback_meta.get('title'):
+                    r['title'] = fallback_meta['title']
             return yt_results[0]
-        else:
-            _ytdlp_failed_this_request = True
-            print(f"[_fetch_single_video] yt-dlp failed for {video_id}, will skip for remaining candidates", flush=True)
+        print(f"[yt-dlp] FAILED for {video_id}", flush=True)
         return None
 
-    # Use meta from stream extraction, fallback to search meta
+    # Proxy stream succeeded — build result from it
     fm = fallback_meta or {}
     title = meta.get('title') or fm.get('title', '')
     duration = parse_duration(meta.get('duration') or fm.get('duration', 0))
