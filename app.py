@@ -18,6 +18,8 @@ app = Flask(__name__)
 
 PIPED_INSTANCES = [
     "https://api.piped.private.coffee",
+    "https://pipedapi.kavin.rocks",
+    "https://api-piped.mha.fi",
 ]
 
 # Cache for dynamic piped instances
@@ -25,12 +27,13 @@ _dynamic_piped_instances = []
 _last_piped_fetch = 0
 
 INVIDIOUS_INSTANCES = [
-    # PRIMARY: Only instance with API=true AND 99.5% playback ratio
     "https://inv.thepixora.com",
-    # SECONDARY: API=false but sometimes still serves streams
     "https://invidious.nerdvpn.de",
     "https://inv.nadeko.net",
     "https://yewtu.be",
+    "https://invidious.snopyta.org",
+    "https://iv.ggtyler.dev",
+    "https://invidious.flokinet.to",
 ]
 
 # ─────────────────────────────────────────────────────────────
@@ -626,16 +629,19 @@ class YtDlpBackend:
         writable_cookie = os.path.join(tempfile.gettempdir(), 'yt_cookies.txt')
         cookie_paths = []
         
-        # If cookies were passed directly into the request from n8n
         passed_cookies = kwargs.get('cookies_content')
         if passed_cookies:
+            # Ensure passed_cookies is handled correctly
+            if not isinstance(passed_cookies, str):
+                passed_cookies = str(passed_cookies)
             try:
-                with open(writable_cookie, 'w', encoding='utf-8') as f:
-                    f.write(passed_cookies)
+                # Write as binary to avoid encoding/newline issues with different OS sources
+                with open(writable_cookie, 'wb') as f:
+                    f.write(passed_cookies.encode('utf-8'))
                 cookie_paths.append(writable_cookie)
                 print("[yt-dlp] Using cookies provided in API payload!", flush=True)
             except Exception as e:
-                print(f"[yt-dlp] Failed to write API payload cookies: {e}")
+                print(f"[yt-dlp] Failed to write cookie payload: {e}", flush=True)
         
         # Fallback to local disk paths
         cookie_paths.extend(['/etc/secrets/cookies.txt', writable_cookie, os.path.join(os.getcwd(), 'cookies.txt')])
@@ -827,24 +833,23 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
     _ytdlp_failed_this_request = False
 
     final_results = []
-    # Only try up to 3 candidates to avoid looping through all 20 and timing out
-    for sr in filtered[:3]:
-        if len(final_results) >= max_results:
+    total_found = 0
+    # Iterate through all filtered candidates until we find enough or time out
+    for sr in filtered:
+        if total_found >= max_results:
             break
-        
-        # Check time budget: if we are over 35s, return what we have
-        if elapsed() > 35:
-            print(f"[Orchestrator] Time budget reached (35s). Returning {len(final_results)} results.", flush=True)
+
+        if elapsed() > 45:
+            print("[Orchestrator] Timed out before completing candidates", flush=True)
             break
 
         video_id = sr['videoId']
-        kw_for_fetch = {k: v for k, v in kwargs.items() if k not in ['type', 'quality', 'max_filesize_mb']}
-        result = _fetch_single_video(
-            video_id, media_type, quality, max_filesize_mb,
-            fallback_meta=sr, **kw_for_fetch
-        )
+        result = _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback_meta=sr, **kwargs)
         if result:
             final_results.append(result)
+            total_found += 1
+        else:
+            print(f"[Orchestrator] Extraction failed for {video_id}, trying next candidate...", flush=True)
 
     if final_results:
         return final_results, None
