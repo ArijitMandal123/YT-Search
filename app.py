@@ -842,7 +842,8 @@ def perform_search_multi(query, is_direct_url=False, **kwargs):
             break
 
         video_id = sr['videoId']
-        result = _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback_meta=sr, **kwargs)
+        kw_for_fetch = {k: v for k, v in kwargs.items() if k not in ('type', 'quality', 'max_filesize_mb')}
+        result = _fetch_single_video(video_id, media_type, quality, max_filesize_mb, fallback_meta=sr, **kw_for_fetch)
         if result:
             final_results.append(result)
             total_found += 1
