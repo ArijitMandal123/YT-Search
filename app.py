@@ -644,22 +644,12 @@ class YtDlpBackend:
             except Exception as e:
                 print(f"[yt-dlp] Failed to write cookie payload: {e}", flush=True)
         
-        # Fallback to local disk paths
-        cookie_paths.extend(['/etc/secrets/cookies.txt', writable_cookie, os.path.join(os.getcwd(), 'cookies.txt')])
-        
+        # Only use cookies if explicitly passed in the payload. 
+        # Do NOT auto-load /etc/secrets/cookies.txt because burnt cookies block the mediaconnect anonymous bypass!
         for cp in cookie_paths:
             if os.path.exists(cp):
-                # If the cookie file is on a read-only FS or we just want to ensure it's writable
-                if cp != writable_cookie:
-                    try:
-                        import shutil
-                        shutil.copy2(cp, writable_cookie)
-                        print(f"[yt-dlp] Copied cookies from {cp} -> {writable_cookie}", flush=True)
-                        cp = writable_cookie
-                    except Exception as copy_err:
-                        print(f"[yt-dlp] Could not copy cookies: {copy_err}", flush=True)
                 ydl_opts['cookiefile'] = cp
-                print(f"[yt-dlp] Using cookies from {cp}", flush=True)
+                print(f"[yt-dlp] Using cookies explicitly provided in payload: {cp}", flush=True)
                 break
 
         results = []
