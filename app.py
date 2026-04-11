@@ -44,7 +44,9 @@ def search_youtube():
         query=query, 
         max_results=max_results, 
         timeout=25.0, 
-        enrich=enrich
+        enrich=enrich,
+        duration_min=data.get('duration_min'),
+        duration_max=data.get('duration_max')
     )
 
     # ── Phase 2: Fallback to Simplified Query ──
@@ -56,24 +58,10 @@ def search_youtube():
                 query=simp, 
                 max_results=max_results, 
                 timeout=25.0, 
-                enrich=enrich
+                enrich=enrich,
+                duration_min=data.get('duration_min'),
+                duration_max=data.get('duration_max')
             )
-
-    # ── Filter by duration if requested in JSON ──
-    d_min = data.get('duration_min')
-    d_max = data.get('duration_max')
-    if d_min or d_max:
-        filtered_results = []
-        for r in results:
-            dur = r.get('duration_seconds')
-            if dur is None:
-                continue
-            if d_min and dur < d_min:
-                continue
-            if d_max and dur > d_max:
-                continue
-            filtered_results.append(r)
-        results = filtered_results
 
     # ── Return Final JSON ──
     return jsonify({

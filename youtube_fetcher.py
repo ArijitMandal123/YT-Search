@@ -355,7 +355,7 @@ def _enrich_invidious_video(session: requests.Session, base: str, video: dict[st
     _merge_invidious_video_payload(payload, video)
 
 
-def _piped_items_to_videos(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+def _piped_items_to_videos(items: list[dict[str, Any]], limit: int, duration_min: int | None = None, duration_max: int | None = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for item in items:
         if len(out) >= limit:
@@ -364,11 +364,21 @@ def _piped_items_to_videos(items: list[dict[str, Any]], limit: int) -> list[dict
             continue
         row = _video_from_piped_item(item)
         if row:
+            dur = row.get("duration_seconds")
+            # Filter live streams (dur = 0 or None) if duration filters exist
+            if dur is None or dur == 0:
+                if duration_min or duration_max:
+                    continue
+            else:
+                if duration_min and dur < duration_min:
+                    continue
+                if duration_max and dur > duration_max:
+                    continue
             out.append(row)
     return out
 
 
-def _invidious_items_to_videos(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+def _invidious_items_to_videos(items: list[dict[str, Any]], limit: int, duration_min: int | None = None, duration_max: int | None = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for item in items:
         if len(out) >= limit:
@@ -377,6 +387,15 @@ def _invidious_items_to_videos(items: list[dict[str, Any]], limit: int) -> list[
             continue
         row = _video_from_invidious_item(item)
         if row:
+            dur = row.get("duration_seconds")
+            if dur is None or dur == 0:
+                if duration_min or duration_max:
+                    continue
+            else:
+                if duration_min and dur < duration_min:
+                    continue
+                if duration_max and dur > duration_max:
+                    continue
             out.append(row)
     return out
 
@@ -411,6 +430,8 @@ def search_youtube_links(
     max_results: int = 10,
     timeout: float = 25.0,
     enrich: bool = True,
+    duration_min: int | None = None,
+    duration_max: int | None = None,
     session: requests.Session | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """
@@ -454,7 +475,7 @@ def search_youtube_links(
         items = payload.get("items")
         if not isinstance(items, list):
             continue
-        results = _piped_items_to_videos(items, max_results)
+        results = _piped_items_to_videos(items, max_results, duration_min, duration_max)
         if results:
             if enrich:
                 per = min(20.0, max(5.0, timeout))
@@ -481,7 +502,7 @@ def search_youtube_links(
             continue
         if not isinstance(payload, list):
             continue
-        results = _invidious_items_to_videos(payload, max_results)
+        results = _invidious_items_to_videos(payload, max_results, duration_min, duration_max)
         if results:
             if enrich:
                 per = min(20.0, max(5.0, timeout))
