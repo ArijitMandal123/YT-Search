@@ -43,7 +43,7 @@ def search_youtube():
     results, backend_used = search_youtube_links(
         query=query, 
         max_results=max_results, 
-        timeout=25.0, 
+        timeout=6.0, 
         enrich=enrich,
         duration_min=data.get('duration_min'),
         duration_max=data.get('duration_max')
@@ -57,7 +57,7 @@ def search_youtube():
             results, backend_used = search_youtube_links(
                 query=simp, 
                 max_results=max_results, 
-                timeout=25.0, 
+                timeout=6.0, 
                 enrich=enrich,
                 duration_min=data.get('duration_min'),
                 duration_max=data.get('duration_max')
